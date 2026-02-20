@@ -1,0 +1,222 @@
+BITACORA 1 - XyaoLED LED Matrix Reverse Engineering
+=====================================================
+Date: Feb 20, 2026
+
+DEVICE INFO
+-----------
+- Device: XyaoLED LED Matrix (model "XyaoLED_44BF")
+- BLE Name: XyaoLED_44BF
+- MAC Address (from app): 46:62:d7:5d:44:bf
+- macOS BLE UUID: 01DC102F-B8D9-1ACB-2353-441F394DA3A3
+- Official app: com.smadom.xyaoled (Flutter app on Android)
+- Phone used for sniffing: Rooted Xiaomi MI 9 (adb device ID: 75f7f500)
+
+BLE GATT STRUCTURE
+------------------
+- Service: 0000AE00
+  - Characteristic AE01 (handle 129/0x0081, write in bleak; 130/0x0082 in HCI snoop)
+    -> Write-without-response. All commands go here.
+  - Characteristic AE02 (handle 131/0x0083, notify in bleak; 132/0x0084 in HCI snoop)
+    -> Notifications. Device responses come here.
+  - CCCD handle 133/0x0085
+    -> Write 0x0100 to enable notifications. The app does this before every command group.
+
+NOTE: bleak uses characteristic handles (129/131), HCI snoop shows ATT handles (130/132).
+      They differ by 1. When reading Wireshark captures, the write handle is 0x0082 and
+      the notify handle is 0x0084.
+
+PROTOCOL FORMAT
+---------------
+All commands sent to the device follow this structure:
+
+  [99 aa 00 2e ff 88] [LEN] [00] [CMD] [SUB] [SEQ] [DATA...]
+
+  - 99 aa 00 2e ff 88  = 6-byte magic header (constant, every packet)
+  - LEN                 = total length of everything after the 6-byte header
+  - 00                  = always 0x00
+  - CMD                 = command type (see below)
+  - SUB                 = sub-command or slot ID
+  - SEQ                 = sequence number
+  - DATA                = command-specific payload
+
+All notifications from the device start with:
+
+  [88 ff] [TYPE] [LEN] [DATA...]
+
+  - 88 ff   = magic header (note: reverse of the ff 88 in write header)
+  - TYPE    = response type:
+      0x00 = status/heartbeat (24 bytes total, periodic)
+      0x03 = bitmap acknowledgment (13 bytes total)
+      0x04 = display control ack (11 bytes total)
+      0x05 = command complete ack (11 bytes total)
+
+COMMAND TYPES (CMD byte)
+------------------------
+  0x00 = Handshake/heartbeat
+         31 bytes total. Sent periodically and before command groups.
+         Contains timestamp and hash in payload. Purpose not fully understood.
+
+  0x04 = Text init
+         13 bytes total. Tells device: "incoming bitmap for slot N, color X"
+         Format: header + 0d 00 04 [SUB] [SEQ] [COLOR_HI] [COLOR_LO]
+         Example: 99aa002eff88 0d 00 04 02 03 ff 00
+                  -> text init, sub=0x02, seq=0x03, color=ff00
+
+  0x07 = Bitmap data
+         Variable length (100-244 bytes observed). Contains pixel data.
+         The SEQ must match the preceding text_init SEQ.
+         Has a 28-byte metadata header before pixel rows.
+
+  0x0e = Config command (14 bytes total). Purpose unclear. Seen during setup.
+
+  0x0f = Config/speed command (15 bytes total). Possibly scroll speed.
+         Format: header + 0f 00 0a 00 [SEQ] 00000000
+
+  0x11 = Display control / ON / OFF
+         17-18 bytes total.
+         ON:  header + 12 00 11 00 [SEQ] 01 01 01 00 00 00 00
+         OFF: header + 12 00 11 00 [SEQ] 02 01 01 00 00 00 00
+         Also used for playlist activation with different payloads:
+           02 00 00 00 00 00 = disable/clear a slot
+           01 01 00 00 00 00 = enable a slot
+
+WHAT WORKS (confirmed from Python)
+-----------------------------------
+- ON:  99aa002eff88 12 00 11 00 [SEQ] 01 01 01 00 00 00 00
+- OFF: 99aa002eff88 12 00 11 00 [SEQ] 02 01 01 00 00 00 00
+- Replay of captured bitmap sequences (text_init + bitmap_data)
+  Successfully displayed BBBB and CCCC by replaying exact captured bytes.
+
+WHAT DOESN'T FULLY WORK YET
+-----------------------------
+- Generating our own bitmap data from scratch (font rendering)
+- Understanding all the handshake/setup sequence needed before sending bitmaps
+- The display_ctrl commands (cmd 0x11 with payload 02000000) seem to turn the device off
+
+BITMAP DATA FORMAT (cmd 0x07)
+-----------------------------
+After the 5-byte command header (LEN, 00, 07, SUB, SEQ), the bitmap has:
+
+  28-byte metadata header:
+    [0-1]   LE uint16: bitmap data length (bytes after this header)
+    [2-3]   LE uint16: 0x0002 (constant?)
+    [4-5]   LE uint16: 0x0002 (constant?)
+    [6-7]   LE uint16: 0x0001 (constant? or related to char count)
+    [8-9]   LE uint16: number of pages in this packet (1, 2, or 4 observed)
+    [10-11]  LE uint16: 0x0003 (constant?)
+    [12-13]  LE uint16: 0x0000
+    [14-15]  LE uint16: 0x0000 (or green component?)
+    [16-17]  LE uint16: RED color (0xff00 = red, 0x0000 = no red)
+    [18-19]  LE uint16: BLUE color (0xff00 = blue, 0x0000 = no blue)
+    [20-21]  LE uint16: 0x00ff (constant? or related to brightness)
+    [22-23]  LE uint16: 0x003c = 60 (scroll speed in ms? or display time)
+    [24-27]  4 bytes: usually 0x00000000
+
+  Pixel data:
+    - Each row = 4 bytes (32-bit LE word)
+    - Bits are LSB-first (bit 0 = leftmost pixel)
+    - Each page = 16 rows (15 pixel rows + 1 padding row of zeros)
+    - 1 page ~ 2 characters wide on the display
+    - Multiple pages per packet for longer text
+
+COLOR ENCODING
+--------------
+Tested and confirmed:
+  - RED:   metadata offset 16-17 = 0xff00, offset 18-19 = 0x0000
+  - BLUE:  metadata offset 16-17 = 0x0000, offset 18-19 = 0xff00
+  - GREEN: not yet confirmed, likely offset 14-15
+
+The text_init color field (last 2 bytes) is "ff00" for both red and blue,
+so it may not indicate the actual color — the real color is in the bitmap metadata.
+
+PLAYLIST / APP BEHAVIOR
+------------------------
+The official app uses a "Playlist" concept:
+  - User creates multiple DIY text items in a list
+  - Each item has text, color, speed settings
+  - When sent, the entire playlist is pushed to the device
+  - Each playlist item gets a sequential slot/seq number (0x02, 0x03, 0x04...)
+  - The device stores items in memory and cycles through them
+
+The app renders text using Android Canvas API (in MainActivity.java) at a
+font size larger than a simple 5x7 pixel font. The resulting bitmap is ~11 rows
+tall per character.
+
+Text splitting:
+  - The display has limited width
+  - Long text is split across multiple pages
+  - Each page is sent as a separate bitmap (or multiple pages in one large packet)
+  - Observed splits: "BBBB" -> "BBB" + "B", "CCCC" -> "CC" + "CC"
+  - "ABCDEFGHI" -> "AB" + "CDE" + "FGH" + "I" (4 pages in one 244-byte packet)
+
+SEND SEQUENCE (from clean BBBB/CCCC capture)
+---------------------------------------------
+For each playlist item:
+  1. Write 0x0100 to CCCD handle (0x0085) to enable notifications
+  2. Send handshake packet (cmd 0x00, 31 bytes)
+  3. Wait for status notification (88ff 00...)
+  4. Send text_init (cmd 0x04) with slot number and color
+  5. Wait for bitmap ack notification (88ff 03...)
+  6. Send bitmap_data (cmd 0x07) with matching slot/seq number
+  7. Wait for bitmap ack + complete ack (88ff 03... + 88ff 05...)
+  8. Optionally send config (cmd 0x0f) and display_ctrl (cmd 0x11)
+  9. Send activate (cmd 0x11 with enable payload)
+
+The device acknowledges each bitmap with notifications, and the app appears
+to wait for these before proceeding. Our replay scripts did NOT wait for acks
+and still worked, so ack-waiting may not be strictly required.
+
+CAPTURE FILES
+-------------
+  btsnoop_hci.log      - initial capture (stale, from /sdcard/)
+  btsnoop_aaaa.log     - "AAAA" in red (actually same as old capture from /sdcard/)
+  btsnoop_bbcc.log     - clean capture: BBBB + CCCC in red (from /data/misc/bluetooth/logs/)
+  btsnoop_abcdefg.log  - clean capture: ABCDEFGHI in blue (from /data/misc/bluetooth/logs/)
+
+IMPORTANT: The live snoop log is at /data/misc/bluetooth/logs/btsnoop_hci.log
+           The file at /sdcard/btsnoop_hci.log is stale and does NOT update.
+           To pull the fresh log:
+             adb shell su -c "cp /data/misc/bluetooth/logs/btsnoop_hci.log /sdcard/btsnoop_fresh.log"
+             adb pull /sdcard/btsnoop_fresh.log ./output.log
+
+HOW TO CAPTURE BLE TRAFFIC
+---------------------------
+  1. adb -s 75f7f500 shell svc bluetooth disable
+  2. adb -s 75f7f500 shell svc bluetooth enable
+  3. Perform actions in the XyaoLED app on the phone
+  4. Pull the log:
+       adb -s 75f7f500 shell su -c "cp /data/misc/bluetooth/logs/btsnoop_hci.log /sdcard/btsnoop_fresh.log"
+       adb -s 75f7f500 pull /sdcard/btsnoop_fresh.log ./capture_name.log
+  5. Parse: source .venv/bin/activate && python3 parse_btsnoop.py capture_name.log
+  6. Or open in Wireshark (File -> Open, it reads btsnoop natively)
+
+WIRESHARK FILTERS
+-----------------
+  btatt                               - all ATT protocol
+  btatt.handle == 0x0082              - writes to device (commands)
+  btatt.handle == 0x0084              - notifications from device
+  btatt.opcode == 0x52                - Write Command (no response)
+  btatt.opcode == 0x12                - Write Request (with response)
+  btatt.opcode == 0x1b                - Notifications
+  btatt.handle == 0x0082 || btatt.handle == 0x0084  - all interesting traffic
+
+TOOLS / SCRIPTS
+---------------
+  parse_btsnoop.py     - Parse btsnoop HCI logs, extract ATT writes and notifications
+  xyaoled_onoff.py     - Working ON/OFF control from Python
+  replay_bbbb.py       - Replay captured BBBB sequence
+  replay_cccc.py       - Replay captured CCCC sequence
+  src/connection.py    - BLE connection manager (bleak)
+  src/commands.py      - Protocol packet builders
+  src/font.py          - 5x7 bitmap font renderer
+  src/device.py        - XyaoLED device class
+  src/main.py          - Interactive CLI
+
+NEXT STEPS
+----------
+  1. Try replaying the ABCDEFGHI captured bytes to confirm they work
+  2. Figure out the exact handshake/setup sequence needed (do we need cmd 0x00?)
+  3. Understand the display_ctrl (cmd 0x11) variants — which ones turn off vs enable
+  4. Learn to generate bitmap data matching the app's font rendering
+  5. Confirm green color encoding
+  6. Build a complete send_text() function that works from scratch

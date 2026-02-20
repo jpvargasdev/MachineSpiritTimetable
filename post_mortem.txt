@@ -1,0 +1,879 @@
+================================================================================
+  XyaoLED BLE REVERSE ENGINEERING - POST MORTEM
+================================================================================
+
+  Project: /Users/juan/LED/
+  Device:  XyaoLED_44BF (LED matrix, 16px tall, BLE-controlled)
+  Phone:   Rooted Xiaomi MI 9 (device ID: 75f7f500)
+  App:     com.smadom.xyaoled (Flutter + native Android BLE bridge)
+  Mac:     macOS, Python 3.13, bleak 2.1.1
+
+  Status:  ON/OFF works from Python. Text display does NOT work yet.
+           The protocol for text is partially decoded but something is
+           still wrong -- likely the metadata bytes, the bitmap encoding,
+           or the init/activate handshake is incomplete.
+
+================================================================================
+  TABLE OF CONTENTS
+================================================================================
+
+  1. HOW EVERYTHING FITS TOGETHER
+  2. THE DEVICE (BLE GATT MAP)
+  3. HOW TO CAPTURE BLE TRAFFIC (HCI SNOOP LOG)
+  4. HOW TO PULL AND OPEN THE LOG FILE
+  5. HOW TO PARSE THE LOG (parse_btsnoop.py)
+  6. THE PROTOCOL (WHAT WE KNOW)
+  7. WHAT WORKS AND WHAT DOESN'T
+  8. THE APK (DECOMPILATION AND KEY FINDINGS)
+  9. PROJECT FILE REFERENCE
+  10. HOW TO RUN THINGS
+  11. WHAT TO TRY NEXT
+  12. RAW CAPTURED DATA (ANNOTATED)
+
+
+================================================================================
+  1. HOW EVERYTHING FITS TOGETHER
+================================================================================
+
+  The approach was:
+
+    1. Scan for the BLE device from macOS           (scan_xyaoled.py)
+    2. Connect and enumerate GATT services           (explore_xyaoled.py)
+    3. Try known LED protocols (Zengge, iDotMatrix)  (test_xyaoled.py)
+       -- ALL FAILED. This device uses a custom protocol.
+    4. Decompile the Android APK to find clues        (jadx -> xyaoled_decompiled/)
+       -- Found: service UUID AE00, write char AE01 (handle 129),
+          notify char AE02 (handle 131). Protocol bytes are built in
+          Dart (libapp.so), not in Java. Java is just a thin transport.
+    5. Capture real BLE traffic from the phone        (HCI snoop log)
+       -- This is the goldmine. The phone's Bluetooth stack logs every
+          BLE packet to a binary file.
+    6. Parse the captured traffic                     (parse_btsnoop.py)
+    7. Analyze byte patterns to decode the protocol   (analyze_protocol.py)
+    8. Build a working Python controller               (src/)
+
+  The critical insight: the actual protocol bytes are constructed inside
+  the compiled Dart code (libapp.so, 7.8MB), NOT in the Java layer.
+  The Java side just takes a hex string from Flutter and writes it to
+  the BLE characteristic. So decompiling the APK only tells you WHERE
+  to write, not WHAT to write. For that, you need the traffic capture.
+
+
+================================================================================
+  2. THE DEVICE (BLE GATT MAP)
+================================================================================
+
+  Device name:   XyaoLED_44BF
+  MAC (Android):  46:62:d7:5d:44:bf
+  UUID (macOS):   01DC102F-B8D9-1ACB-2353-441F394DA3A3
+  RSSI:           ~-52 to -55
+
+  The device exposes 3 BLE services. Only the THIRD one matters:
+
+  Service 1: 0000AE30-0000-1000-8000-00805f9b34fb
+    - AE01 (handle  5)  write-without-response
+    - AE02 (handle  7)  notify
+    - AE03 (handle 10)  write-without-response
+    - AE04 (handle 12)  notify
+    - AE10 (handle 18)  read, write
+    ** NOT USED for commands **
+
+  Service 2: 0000AE3A-0000-1000-8000-00805f9b34fb
+    - AE3B (handle 65)  write-without-response
+    - AE3C (handle 67)  notify
+    ** NOT USED for commands **
+
+  Service 3: 0000AE00-0000-1000-8000-00805f9b34fb   <--- THE ONE
+    - AE01 (handle 129) write-without-response  <--- COMMANDS GO HERE
+    - AE02 (handle 131) notify                  <--- RESPONSES COME HERE
+
+  IMPORTANT: The UUID "AE01" appears in BOTH service 1 and service 3.
+  You MUST use the handle number (129), not the UUID, when writing with
+  bleak. Otherwise bleak might pick the wrong characteristic.
+
+  The CCCD (Client Characteristic Configuration Descriptor) for
+  enabling notifications is at handle 133 (write 0x0100 to it).
+  bleak does this automatically with start_notify().
+
+  ATT-level handles (as seen in HCI captures):
+    - Write target:  ATT handle 0x0082 (130) = GATT handle 129
+    - Notify source: ATT handle 0x0084 (132) = GATT handle 131
+    (The ATT handle is always GATT handle + 1 for write commands)
+
+
+================================================================================
+  3. HOW TO CAPTURE BLE TRAFFIC (HCI SNOOP LOG)
+================================================================================
+
+  This is the most important technique. Android can log ALL Bluetooth
+  HCI (Host Controller Interface) traffic to a binary file. This
+  captures the raw bytes sent to and received from the BLE device.
+
+  SETUP (one-time, requires root):
+
+    # Enable HCI snoop logging on the phone:
+    adb shell su -c "setprop persist.bluetooth.btsnooplogmode full"
+    adb shell su -c "setprop persist.bluetooth.btsnoopenable true"
+
+    # Verify:
+    adb shell su -c "getprop persist.bluetooth.btsnooplogmode"
+    # Should print: full
+    adb shell su -c "getprop persist.bluetooth.btsnoopenable"
+    # Should print: true
+
+  CAPTURE WORKFLOW:
+
+    1. Restart Bluetooth on the phone to start a fresh log:
+       adb shell su -c "svc bluetooth disable"
+       adb shell su -c "svc bluetooth enable"
+
+    2. Open the XyaoLED app on the phone and do whatever you want
+       to capture (turn on, turn off, send text, change color, etc.)
+
+    3. Pull the log file. The location varies by Android version.
+       On this Xiaomi MI 9 (MIUI), it's in the bugreport:
+
+       adb bugreport bugreport.zip
+
+       Then unzip it and look for btsnoop_hci.log inside.
+
+       On some phones it's directly at:
+       /data/misc/bluetooth/logs/btsnoop_hci.log
+       or:
+       /sdcard/btsnoop_hci.log
+
+       To pull directly (if accessible):
+       adb shell su -c "cp /data/misc/bluetooth/logs/btsnoop_hci.log /sdcard/"
+       adb pull /sdcard/btsnoop_hci.log
+
+    4. Parse it with parse_btsnoop.py (see section 5).
+
+  TIPS:
+    - Restart Bluetooth BEFORE each capture session so the log is clean.
+    - Do ONE specific action per capture (e.g., only ON/OFF, or only
+      text display). This makes analysis much easier.
+    - The log file grows with ALL Bluetooth traffic (not just your app),
+      so keep sessions short.
+
+
+================================================================================
+  4. HOW TO PULL AND OPEN THE LOG FILE
+================================================================================
+
+  Method 1: Via bugreport (always works)
+
+    adb bugreport bugreport.zip
+    unzip bugreport.zip -d bugreport_extracted
+    # The btsnoop file is somewhere inside, usually at:
+    # bugreport_extracted/FS/data/misc/bluetooth/logs/btsnoop_hci.log
+    cp bugreport_extracted/FS/data/misc/bluetooth/logs/btsnoop_hci.log .
+
+  Method 2: Direct pull (needs root)
+
+    adb shell su -c "cp /data/misc/bluetooth/logs/btsnoop_hci.log /sdcard/"
+    adb pull /sdcard/btsnoop_hci.log
+
+  Method 3: Developer options (no root needed)
+
+    On the phone: Settings > Developer Options > Enable Bluetooth HCI
+    snoop log. Then the file is at /sdcard/btsnoop_hci.log (or similar,
+    varies by manufacturer).
+
+  VIEWING THE LOG:
+
+    Option A: Wireshark (GUI, best for exploration)
+      - Open Wireshark
+      - File > Open > btsnoop_hci.log
+      - Wireshark auto-detects the btsnoop format
+      - Filter with: btatt.opcode == 0x52 (for Write Commands)
+        or: btatt.opcode == 0x1b (for Notifications)
+        or: btatt.handle == 0x0082 (for writes to our device)
+      - Right-click a packet > Follow > Bluetooth ATT stream
+
+    Option B: parse_btsnoop.py (CLI, our custom parser)
+      python3 parse_btsnoop.py btsnoop_text.log
+      This extracts all ATT Write and Notification packets and
+      prints them grouped by handle.
+
+    Option C: Android Bluetooth HCI log viewer (various apps)
+
+
+================================================================================
+  5. HOW TO PARSE THE LOG (parse_btsnoop.py)
+================================================================================
+
+  File: /Users/juan/LED/parse_btsnoop.py
+
+  What it does:
+    - Reads a btsnoop_hci.log file (binary format)
+    - Parses the btsnoop header (magic: "btsnoop\x00", version, datalink type)
+    - Iterates over each HCI packet
+    - Filters for ACL data packets (H4 type 0x02)
+    - Extracts L2CAP frames with CID 0x0004 (ATT protocol)
+    - Identifies ATT operations:
+        0x52 = Write Command (write-without-response)
+        0x12 = Write Request (write-with-response)
+        0x1B = Handle Value Notification
+        0x1D = Handle Value Indication
+    - Prints all writes and notifications with handle numbers and hex data
+
+  Usage:
+    source .venv/bin/activate
+    python3 parse_btsnoop.py btsnoop_text.log
+
+  Output format:
+    ATT WRITE OPERATIONS (46 found)
+      # 336 SENT WriteCmd handle=0x0082 (130)  len= 31  data=99aa002e...
+
+    NOTIFICATIONS/INDICATIONS (27 found)
+      # 338 RECV Notification handle=0x0084 (132)  len= 24  data=88ff000b...
+
+    WRITES GROUPED BY HANDLE
+      Handle 0x0082 (130): 35 writes
+        # 336 len= 31  99aa002eff881f0000000d001a...
+
+  What to look for:
+    - Writes to handle 0x0082 = commands sent TO the device
+    - Notifications from handle 0x0084 = responses FROM the device
+    - Ignore writes to handle 0x0085 (that's the CCCD enable: 0x0100)
+    - All real commands start with: 99 aa 00 2e ff 88
+    - All real notifications start with: 88 ff
+
+
+================================================================================
+  6. THE PROTOCOL (WHAT WE KNOW)
+================================================================================
+
+  PACKET FORMAT
+  =============
+
+  Every command is a byte array with this structure:
+
+    Offset  Size  Name         Description
+    ------  ----  -----------  --------------------------------
+    0-5     6     HEADER       Always: 99 aa 00 2e ff 88
+    6       1     TOTAL_LEN    Total packet length in bytes (including this byte and header)
+    7       1     ZERO         Always 0x00
+    8       1     CMD_TYPE     Command type (see below)
+    9       1     SUB_TYPE     Sub-type or flags
+    10      1     SEQ          Sequence counter, increments with each command, wraps at 0xFF
+    11+     var   DATA         Command-specific payload
+
+  The sequence counter starts at some value and increments by 1 for
+  every command sent. It wraps around at 0xFF back to 0x00.
+
+  No checksum has been found. The last bytes of some packets are 0x00
+  padding but there's no XOR/CRC/sum pattern.
+
+
+  COMMAND TYPES (confirmed)
+  =========================
+
+  CMD=0x11, SUB=0x00: POWER / MODE CONTROL (18 bytes total)
+  ---------------------------------------------------------
+    99 aa 00 2e ff 88  12 00 11 00  [SEQ]  [MODE] 01 01 00 00 00 00
+
+    MODE = 0x01: Turn ON (static/solid color mode)
+    MODE = 0x02: Turn OFF, OR activate text/animation mode
+                 (after sending text data, 0x02 "activates" the display)
+
+    This is confirmed working from Python. Both ON and OFF produce
+    visible results on the device, and the device sends back a
+    notification confirming the state change.
+
+
+  CMD=0x0A, SUB=0x00: CLEAR / PREPARE (15 bytes total)
+  -----------------------------------------------------
+    99 aa 00 2e ff 88  0f 00 0a 00  [SEQ]  00 00 00 00
+
+    Sent before loading new text/image content. Probably clears
+    the display buffer.
+
+
+  CMD=0x04, SUB=0x02: INIT DATA TRANSFER (13 bytes total)
+  --------------------------------------------------------
+    99 aa 00 2e ff 88  0d 00 04 02  [SEQ]  ff 00
+
+    Sent after clear, before bitmap data. The 0xFF 0x00 might indicate
+    "one item" or "item index 255" or something else.
+
+
+  CMD=0x07, SUB=0x02: BITMAP DATA (100 bytes total for the captured example)
+  ---------------------------------------------------------------------------
+    This is the big one. Structure:
+
+    Offset  Size  Content
+    ------  ----  -------
+    0-5     6     Header: 99 aa 00 2e ff 88
+    6       1     Total length: 0x64 (100)
+    7       1     0x00
+    8       1     Cmd type: 0x07
+    9       1     Sub type: 0x02
+    10      1     Sequence number
+    11      1     Data length: 0x4C (76) = colors(12) + bitmap(64)
+    12-22   11    Metadata
+    23-34   12    Colors
+    35-98   64    Bitmap (16 rows x 4 bytes big-endian)
+    99      1     Padding: 0x00
+
+    METADATA (11 bytes, from captured "HI" in red):
+      [0]  0x00  padding or item group
+      [1]  0x00  item index within group
+      [2]  0x02  mode: 2=scroll, 1=static (GUESS)
+      [3]  0x00  padding
+      [4]  0x02  direction: 2=left scroll (GUESS)
+      [5]  0x01  font size or font index
+      [6]  0x00  padding
+      [7]  0x00  padding
+      [8]  0x01  bold flag (GUESS)
+      [9]  0x00  padding
+      [10] 0x03  speed setting or sub-mode
+
+    COLORS (12 bytes):
+      [0-3]   Background: R, G, B, 0x00
+      [4-7]   Foreground: R, G, B, 0x00
+      [8-11]  Extra:      0x00, R_fg_again, 0x00, speed
+
+      For red text on black background, this was:
+        00 00 00 00  ff 00 00 00  00 ff 00 3c
+        ^bg black^   ^fg red^^    ^extra^
+
+      The "speed" byte at [11] was 0x3C = 60.
+      The "extra[1]" = 0xFF = the red channel repeated.
+      This might be used for gradient or something.
+
+    BITMAP (64 bytes = 16 rows x 4 bytes):
+      Each row is a 32-bit big-endian integer.
+      MSB = leftmost pixel on the display.
+      The display is 16 pixels tall.
+      Only the lower bits are used (depending on text width).
+      Unused rows (below the text) are all zeros.
+
+      The captured "HI" bitmap (app's larger font, not our 5x7):
+        Row  0: 0x00000030  ..........##....
+        Row  1: 0x00000432  .....#....##..#.
+        Row  2: 0x00000402  .....#........#.
+        Row  3: 0x00000432  .....#....##..#.
+        Row  4: 0x00000432  .....#....##..#.
+        Row  5: 0x0000fc33  ######....##..##
+        Row  6: 0x0000fc33  ######....##..##
+        Row  7: 0x00000432  .....#....##..#.
+        Row  8: 0x00000432  .....#....##..#.
+        Row  9: 0x00000432  .....#....##..#.
+        Row 10: 0x00000432  .....#....##..#.
+        Row 11: 0x00000432  .....#....##..#.
+        Row 12-15: all zeros
+
+
+  TEXT DISPLAY SEQUENCE (4 packets, in order)
+  ============================================
+
+    1. CLEAR:     99aa002eff88 0f000a00 [SEQ] 00000000
+    2. INIT:      99aa002eff88 0d000402 [SEQ] ff00
+    3. BITMAP:    99aa002eff88 64000702 [SEQ] [data_len] [meta] [colors] [bitmap] 00
+    4. ACTIVATE:  99aa002eff88 12001100 [SEQ] 02010100000000
+
+    Each packet uses a different sequence number (incrementing).
+    There should be small delays between packets (~50ms).
+
+
+  NOTIFICATIONS (device responses)
+  ================================
+
+    All start with: 88 ff (note: reversed from the command header ff 88)
+
+    After ON/OFF commands, the device sends a 24-byte notification
+    that includes the current state at byte 11:
+      0x01 = device is ON
+      0x02 = device is OFF (or text mode active)
+
+    After text init (cmd 0x04), the device sends a shorter 11-byte ack:
+      88 ff 04 01 00 00 00 00 00 0b 97
+
+    After bitmap data (cmd 0x07), the device sends two notifications:
+      88 ff 03 00 00 00 00 00 ff ff 00 0d 95   (13 bytes)
+      88 ff 03 01 00 01 02 00 ff ff 00 0d 99   (13 bytes)
+    Then an 11-byte ack:
+      88 ff 05 01 00 00 00 00 00 0b 98
+
+
+  UNKNOWN COMMANDS (captured but not decoded)
+  ============================================
+
+  CMD=0x00, SUB=0x00: HANDSHAKE/SYNC (31 bytes)
+    First packet sent after every reconnection. Contains what looks
+    like timestamps or session tokens (bytes change every session).
+    Example: 99aa002eff88 1f000000 0d 001a02140a14100501000997abdff87300000000
+
+    Byte 11 = seq (increments)
+    Bytes 12+: 0x001a02140a... looks like device config or time sync
+
+  CMD=0x01, SUB=0x07/0x03/0x05/0x0b/0x0c: ACTION COMMANDS (14 bytes)
+    Several 14-byte commands with cmd type 0x01 and varying sub-types.
+    Examples:
+      99aa002eff88 0e000107 [SEQ] 0200
+      99aa002eff88 0e000103 [SEQ] 0200
+      99aa002eff88 0e000105 [SEQ] 0200
+      99aa002eff88 0e00010b [SEQ] 0200
+      99aa002eff88 0e00010c [SEQ] 0200
+    These might be: query brightness, query mode, query settings, etc.
+    The last 2 bytes are always 02 00.
+
+  CMD=0x06, SUB=0x00: UNKNOWN (17 bytes)
+    99aa002eff88 11000600 [SEQ] 020000000000
+    Might be a mode/config command. Seen once.
+
+
+================================================================================
+  7. WHAT WORKS AND WHAT DOESN'T
+================================================================================
+
+  WORKS:
+    - BLE scanning and connecting from macOS (bleak)
+    - Subscribing to notifications (handle 131)
+    - Sending ON command  -> device turns on, shows last saved content
+    - Sending OFF command -> device turns off
+    - Reading notification responses
+
+  DOESN'T WORK (YET):
+    - Sending text -> the device doesn't display it
+    - We can build packets that match the captured traffic byte-for-byte,
+      but something about the overall sequence is wrong.
+
+  POSSIBLE REASONS TEXT DOESN'T WORK:
+    1. The 31-byte handshake/sync packet (cmd 0x00) that the app sends
+       on every reconnect might be REQUIRED before text commands work.
+       We never send this. It might put the device in "data receive mode."
+
+    2. The 14-byte action commands (cmd 0x01) might need to be sent
+       in a specific order as part of the init sequence.
+
+    3. Our metadata bytes might be wrong. The 11 metadata bytes were
+       guessed from a single capture. Some of them might be critical
+       (mode, direction, font) and wrong values might cause silent
+       failure.
+
+    4. The bitmap format might be wrong for our 5x7 font. The captured
+       "HI" used the app's larger font (~12px tall with 2px strokes).
+       The device might reject bitmaps that don't match expected dimensions.
+
+    5. The data_len field (byte 11 of the bitmap packet) might be
+       calculated differently than we think. We set it to
+       colors(12) + bitmap(64) = 76, which matches the capture.
+       But if the bitmap size varies with text width, this might need
+       to change.
+
+    6. MTU negotiation: the app requests MTU 503 (seen in f.java line 116).
+       We don't do this. If the default MTU is smaller than our packet
+       (100 bytes), the packet might get silently truncated.
+       bleak's default MTU on macOS should be 185+ but worth checking.
+
+    7. The "ff 00" in the init command (cmd 0x04) might need to encode
+       the number of items or some other parameter.
+
+    8. There might be a timing requirement -- the device might need
+       longer delays between packets, or it might need to ack each
+       packet before the next one is sent.
+
+
+================================================================================
+  8. THE APK (DECOMPILATION AND KEY FINDINGS)
+================================================================================
+
+  GETTING THE APK
+  ===============
+
+    # List installed packages matching "xyao":
+    adb shell pm list packages | grep -i xyao
+    # Output: package:com.smadom.xyaoled
+
+    # Find the APK path:
+    adb shell pm path com.smadom.xyaoled
+    # Output: multiple paths (split APKs):
+    #   /data/app/.../base.apk
+    #   /data/app/.../split_config.arm64_v8a.apk
+    #   /data/app/.../split_config.xxxhdpi.apk
+
+    # Pull them:
+    adb pull /data/app/.../base.apk xyaoled.apk
+    adb pull /data/app/.../split_config.arm64_v8a.apk split_arm64.apk
+
+  DECOMPILING
+  ===========
+
+    # Using jadx (install with: brew install jadx)
+    jadx -d xyaoled_decompiled xyaoled.apk
+
+    # The interesting files are in:
+    # xyaoled_decompiled/sources/com/smadom/xyaoled/
+
+  KEY FILES
+  =========
+
+  f.java (BLE Manager, extends Nordic BLE lib)
+  -------
+    Line 161-168: GATT validation
+      Gets service AE00, then gets chars AE01 (write) and AE02 (notify).
+      This confirmed which service and handles to use.
+
+    Line 94: Data send
+      Uses write-without-response: z(this.f4852k, bArr, 1)
+      where 1 = write type (no response)
+
+    Line 114-118: Init sequence
+      After connection:
+        1. Disable existing notification (safety)
+        2. Request MTU 503
+        3. Enable notification on AE02
+      Then calls onDeviceReady callback
+
+  e.java (Connection Manager, singleton)
+  -------
+    Line 359: Singleton pattern (y() method)
+    Line 624: Connect with retries (3 attempts, 15s timeout, 7 auto-retries)
+    Line 419: G() sends hex string via sendBytes method channel
+    Line 429: H() sends raw byte array
+    Line 179: Scan filter: name.toLowerCase().contains("xyaoled")
+
+  MainActivity.java (Flutter Bridge)
+  -------
+    Line 71: drawTextToBitmap() - renders text on Android Canvas
+    Line 135: e0() - creates ARGB_8888 bitmap, draws text centered,
+              extracts pixel values as 0/1 byte array. This is used
+              for the text bitmap that gets sent over BLE.
+
+    Method channels:
+      "com.smadom.apps/btmanager"  - BLE operations
+      "com.smadom.music/songmanager" - audio playback
+
+  WHERE THE PROTOCOL BYTES ARE BUILT
+  ====================================
+
+    NOT in Java. The Java layer receives pre-built hex strings from Dart
+    (Flutter) via method channel calls. The actual protocol byte
+    construction happens in libapp.so (compiled Dart code, 7.8MB).
+
+    Dart class names found (via string search of libapp.so):
+      _Cmd@381222615     - command builder class
+      _bLe@603004467     - BLE manager class
+
+    To reverse the Dart code, you would need:
+      - reFlutter or darter tools to parse the Dart snapshot
+      - Or use Frida to hook the Dart functions at runtime
+    We tried Frida but it crashed on this MIUI device.
+
+  EXTRACTING libapp.so
+  ====================
+
+    # From the split APK:
+    unzip split_arm64.apk -d split_arm64
+    ls split_arm64/lib/arm64-v8a/
+    # Output: libapp.so  libflutter.so
+
+    The file split_arm64/lib/arm64-v8a/libapp.so (7.8MB) contains
+    all the compiled Dart code including the protocol builder.
+
+
+================================================================================
+  9. PROJECT FILE REFERENCE
+================================================================================
+
+  SCRIPTS (in order of the workflow)
+  -----------------------------------
+
+  scan_xyaoled.py
+    BLE device scanner. Scans for 10 seconds, lists all devices.
+    Run: python3 scan_xyaoled.py
+
+  explore_xyaoled.py
+    Connects to the XyaoLED device and enumerates all GATT services,
+    characteristics, and descriptors. Prints handles and properties.
+    Run: python3 explore_xyaoled.py
+
+  test_xyaoled.py
+    Brute-force protocol tester. Tries Zengge LEDnetWF and iDotMatrix
+    protocols on all writable handles. None of them worked.
+    Run: python3 test_xyaoled.py
+
+  xyaoled_onoff.py
+    First working controller. Sends ON/OFF commands directly.
+    Uses hardcoded protocol bytes derived from HCI capture analysis.
+    Run: python3 xyaoled_onoff.py on
+         python3 xyaoled_onoff.py off
+         python3 xyaoled_onoff.py toggle
+         python3 xyaoled_onoff.py on --stay 30
+
+  parse_btsnoop.py
+    Parses btsnoop HCI log files and extracts all ATT Write and
+    Notification packets. Groups writes by handle. This is the main
+    tool for analyzing captured traffic.
+    Run: python3 parse_btsnoop.py btsnoop_text.log
+
+  analyze_protocol.py
+    Byte-level analysis of captured protocol data. Compares packets
+    by length, checks for checksums (XOR, sum), analyzes sequence
+    numbers. Hardcoded with data from the btsnoop_text.log capture.
+    Run: python3 analyze_protocol.py
+
+  LIBRARY (src/)
+  ---------------
+
+  src/connection.py
+    BLE connection manager. Wraps bleak. Handles connect, disconnect,
+    write (handle 129), notifications (handle 131).
+    Key constants: WRITE_HANDLE=129, NOTIFY_HANDLE=131
+
+  src/commands.py
+    Protocol command builder. Functions:
+      on_cmd(seq)       -> 18 bytes, turns device ON
+      off_cmd(seq)      -> 18 bytes, turns device OFF
+      clear_cmd(seq)    -> 15 bytes, clears display
+      text_init_cmd(seq)-> 13 bytes, inits text transfer
+      text_data_cmd(seq, bitmap, fg_color, bg_color, speed, mode, direction)
+                        -> 100 bytes, bitmap payload
+      activate_cmd(seq) -> 18 bytes, activates display
+
+  src/font.py
+    5x7 bitmap font. Covers A-Z, a-z, 0-9, punctuation.
+    Functions:
+      render_text(text) -> list of 16 ints (32-bit row values)
+      text_width(text)  -> int (pixel width)
+
+  src/device.py
+    High-level API. Class XyaoLED with methods:
+      connect(), disconnect()
+      on(), off()
+      send_text(text, color, speed)
+      send(data)  -- raw bytes
+    Uses async context manager: async with XyaoLED(addr) as dev: ...
+
+  src/main.py
+    Interactive CLI. Commands: on, off, text <msg>, color <r> <g> <b>,
+    speed <n>, quit.
+    Run: cd /Users/juan/LED && python3 -m src.main
+
+  DATA FILES
+  ----------
+
+  btsnoop_hci.log    (50 KB)   First capture, initial connection only
+  btsnoop_onoff.log  (224 KB)  Capture of 10 ON/OFF toggles
+  btsnoop_text.log   (1.2 MB)  Capture of text display "HI" in red
+  bugreport.zip      (16 MB)   Full Android bugreport (contains logs)
+  xyaoled.apk        (23 MB)   Android app (base APK)
+  split_arm64.apk    (36 MB)   Native libraries split APK
+
+  DECOMPILED APK
+  ---------------
+
+  xyaoled_decompiled/sources/com/smadom/xyaoled/
+    MainActivity.java  - Flutter bridge, bitmap rendering
+    a.java             - BLE callback interface (5 methods)
+    d.java             - Music/media query helper
+    e.java             - Connection manager singleton (699 lines)
+    f.java             - Nordic BLE manager (GATT ops, key file)
+    R.java             - Android resource IDs (ignore)
+
+  split_arm64/lib/arm64-v8a/
+    libapp.so          - Compiled Dart code (7.8MB, protocol logic is in here)
+    libflutter.so      - Flutter engine
+
+
+================================================================================
+  10. HOW TO RUN THINGS
+================================================================================
+
+  SETUP:
+
+    cd /Users/juan/LED
+    source .venv/bin/activate
+
+  SCAN FOR DEVICES:
+
+    python3 scan_xyaoled.py
+
+  ENUMERATE GATT:
+
+    python3 explore_xyaoled.py
+
+  TURN ON/OFF (confirmed working):
+
+    python3 xyaoled_onoff.py on --stay 30
+    python3 xyaoled_onoff.py off --stay 10
+    python3 xyaoled_onoff.py toggle
+
+  INTERACTIVE CLI:
+
+    python3 -m src.main
+    # Then type: on, off, text HELLO, quit
+
+  PARSE A CAPTURE:
+
+    python3 parse_btsnoop.py btsnoop_text.log
+
+  CAPTURE NEW TRAFFIC:
+
+    # On the phone:
+    adb shell su -c "svc bluetooth disable"
+    adb shell su -c "svc bluetooth enable"
+    # Wait for Bluetooth to restart
+    # Use the XyaoLED app to do the action you want to capture
+    # Then:
+    adb shell su -c "cp /data/misc/bluetooth/logs/btsnoop_hci.log /sdcard/"
+    adb pull /sdcard/btsnoop_hci.log my_capture.log
+    python3 parse_btsnoop.py my_capture.log
+
+
+================================================================================
+  11. WHAT TO TRY NEXT
+================================================================================
+
+  To get text working, here are the most promising avenues:
+
+  A. CAPTURE MORE COMPLETE SESSIONS
+
+     Do a fresh capture where you:
+       1. Open the app fresh (not already connected)
+       2. Let it connect
+       3. Send text "HI" in red
+       4. Wait for it to display
+       5. Pull the log
+
+     Then compare EVERY packet from connect to text display.
+     The handshake/sync packets (31-byte cmd 0x00) and the action
+     commands (14-byte cmd 0x01) might be required setup steps.
+
+  B. REPLAY THE EXACT CAPTURED SEQUENCE
+
+     Take the exact bytes from btsnoop_text.log and replay them
+     in order, with the same timing. If this works, you know the
+     bytes are right and can narrow down what's different.
+
+     The last 4 packets in btsnoop_text.log are the text sequence:
+       #16022: clear    99aa002eff880f000a002e00000000
+       #16024: init     99aa002eff880d0004022fff00
+       #16028: bitmap   99aa002eff886400070...   (100 bytes)
+       #16032: activate 99aa002eff88120011003002010100000000
+
+     BUT you also need to send the 31-byte handshake first (#16017),
+     and possibly the other setup packets.
+
+  C. SEND THE APP'S HANDSHAKE PACKET
+
+     Every time the app reconnects, it sends a 31-byte cmd 0x00 packet.
+     This might enable a "data receive" mode. Try sending one of the
+     captured handshake packets (with updated sequence number) before
+     the text sequence.
+
+     Example handshake (from capture):
+       99aa002eff881f0000002d001a02140a3939050100c57c822e071100000000
+
+  D. TRY DIFFERENT METADATA VALUES
+
+     The 11 metadata bytes control mode, direction, font, etc.
+     Try setting all to 0x00 first, then vary one byte at a time.
+
+  E. WAIT FOR NOTIFICATION ACKS
+
+     Instead of firing all 4 packets with 50ms delays, wait for
+     the device to send a notification response before sending the
+     next packet. The device might need to ack each step.
+
+  F. NEGOTIATE MTU
+
+     The app requests MTU 503. bleak might be using a smaller MTU.
+     Try:
+       client.mtu_size  # check current MTU after connect
+     If it's less than 100, your bitmap packet gets split/dropped.
+
+  G. USE WIRESHARK FOR DEEPER ANALYSIS
+
+     Open btsnoop_text.log in Wireshark and look at the full
+     packet flow, including connection setup, MTU negotiation,
+     and any packets our parser might be missing.
+
+  H. TRY FRIDA AGAIN
+
+     Frida can hook the Dart functions at runtime to see exactly
+     what bytes the app constructs. It crashed on MIUI before
+     (theme_compatibility.xml error) but might work with:
+       - A different Frida version
+       - Disabling MIUI optimizations
+       - Using frida-gadget instead of frida-server
+     The frida-server binary is already at /Users/juan/LED/frida-server
+
+
+================================================================================
+  12. RAW CAPTURED DATA (ANNOTATED)
+================================================================================
+
+  From btsnoop_text.log, the last text-sending session.
+  These are writes to handle 0x0082 (ATT) = handle 129 (GATT) = char AE01.
+
+  --- Session reconnect ---
+
+  Pkt #16017: Handshake/sync (31 bytes, cmd 0x00)
+  99aa002eff88 1f 00 00 00 2d 001a02140a3939050100c57c822e071100000000
+                ^len  ^cmd ^sub ^seq ^--- unknown session data ---^
+
+  --- Text sending sequence ---
+
+  Pkt #16022: Clear display (15 bytes, cmd 0x0a)
+  99aa002eff88 0f 00 0a 00 2e 00000000
+                ^len  ^cmd ^sub ^seq
+
+  Pkt #16024: Init text transfer (13 bytes, cmd 0x04)
+  99aa002eff88 0d 00 04 02 2f ff00
+                ^len  ^cmd ^sub ^seq ^data
+
+  Pkt #16028: Bitmap data (100 bytes, cmd 0x07)
+  99aa002eff88 64 00 07 02 2f 4c
+                ^len  ^cmd ^sub ^seq ^data_len=76
+  00 00 02 00 02 01 00 00 01 00 03       <- metadata (11 bytes)
+  00 00 00 00 ff 00 00 00 00 ff 00 3c    <- colors (12 bytes): bg=black, fg=red, speed=60
+  00000030 00000432 00000402 00000432     <- bitmap rows 0-3
+  00000432 0000fc33 0000fc33 00000432     <- bitmap rows 4-7
+  00000432 00000432 00000432 00000432     <- bitmap rows 8-11
+  00000000 00000000 00000000 00000000     <- bitmap rows 12-15
+  00                                      <- padding byte
+
+  Pkt #16032: Activate display (18 bytes, cmd 0x11)
+  99aa002eff88 12 00 11 00 30 02 01 01 00 00 00 00
+                ^len  ^cmd ^sub ^seq ^mode=0x02 (activate/text mode)
+
+  --- Device responses ---
+
+  After init (#16024), device sends:
+    88ff 030000000000ffff000d95   (13 bytes)
+
+  After bitmap (#16028), device sends:
+    88ff 030100010200ffff000d99   (13 bytes)
+    88ff 050100000000000b98       (11 bytes)
+
+  After activate (#16032), device sends:
+    88ff 000b01012000100004006417010050180002010000af  (24 bytes)
+    (This is the standard state notification)
+
+
+  SEQUENCE NUMBERS across this session:
+    Handshake: seq=0x2D (45)
+    Clear:     seq=0x2E (46)
+    Init:      seq=0x2F (47)
+    Bitmap:    seq=0x2F (47)  <-- NOTE: same as init! Not incremented?
+                                  Or maybe this was a retransmit?
+    Activate:  seq=0x30 (48)
+
+  This is suspicious. The bitmap and init share seq=0x2F. This might
+  mean the init and bitmap are part of the same "logical command" and
+  share a sequence number, OR the sequence counter was not incremented.
+  Our current code increments for every packet, which might be wrong.
+
+
+================================================================================
+
+  Good luck. The hard part (finding the service, confirming ON/OFF,
+  capturing traffic) is done. The remaining work is getting the exact
+  text packet sequence right -- probably a matter of replaying the
+  captured bytes more faithfully, including the handshake and possibly
+  sharing sequence numbers between init and bitmap packets.
+
+================================================================================

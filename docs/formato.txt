@@ -1,0 +1,421 @@
+FORMATO DE PROTOCOLO BLE - XyaoLED LED Matrix
+================================================
+Referencia completa del protocolo de comunicacion BLE.
+Fecha: Feb 20, 2026
+
+
+===============================================================================
+1. ESTRUCTURA GENERAL DE PAQUETES
+===============================================================================
+
+Todos los comandos enviados al dispositivo tienen esta estructura:
+
+  Offset  Tam  Campo
+  ------  ---  -----
+  [0-5]    6   Magic header: 99 AA 00 2E FF 88 (constante)
+  [6]      1   LEN = tamano total del paquete en bytes
+  [7]      1   Siempre 0x00
+  [8]      1   CMD = tipo de comando
+  [9]      1   SUB = sub-comando o ID de slot
+  [10]     1   SEQ = numero de secuencia
+  [11...]  N   DATA = payload especifico del comando
+
+Ejemplo: un paquete de 13 bytes tiene LEN = 0x0D = 13.
+
+
+Las notificaciones del dispositivo empiezan con:
+
+  [88 FF] [TYPE] [LEN] [DATA...]
+
+  TYPE:
+    0x00 = Status/heartbeat (24 bytes)
+    0x03 = Bitmap ack (13 bytes)
+    0x04 = Display control ack (11 bytes)
+    0x05 = Command complete ack (11 bytes)
+
+
+===============================================================================
+2. HANDSHAKE (CMD = 0x00)
+===============================================================================
+
+Paquete de 31 bytes enviado antes de cada grupo de comandos.
+Contiene un timestamp y un hash/token cuyo proposito exacto no esta claro.
+En la practica, se puede reenviar un handshake capturado y funciona.
+
+Formato:
+  [0-5]   Magic header
+  [6]     0x1F (31 = tamano total)
+  [7]     0x00
+  [8]     0x00 (CMD = handshake)
+  [9]     0x00 (SUB)
+  [10]    SEQ (normalmente 0x01)
+  [11]    0x1A (constante? = 26)
+  [12-18] Timestamp: 7 bytes, posiblemente BCD
+  [19-24] Hash/token: 6 bytes, cambia cada vez
+  [25-30] 0x00 0x00 0x00 0x00 0x00 0x00
+
+Ejemplo capturado (hello rojo, preview):
+  99 AA 00 2E FF 88 1F 00 00 00 01 1A 02 14 0F 1B 02 05 01 00 43 58 97 DC 6D D5 00 00 00 00 00
+  |-- magic header --| LN 00 CM SB SQ |--- timestamp -----|  |--- hash/token --|  |-- padding --|
+
+  Timestamp bytes: 02 14 0F 1B 02 05 01
+    Posible lectura BCD: 2026-02-15 27:02:05:01 (el formato exacto no esta confirmado)
+
+  Hash bytes: 43 58 97 DC 6D D5
+    Cambia en cada sesion. El dispositivo lo acepta sin verificar (replays funcionan).
+
+
+Respuesta del dispositivo:
+  88 FF 00 0B 01 01 20 00 10 00 04 01 64 02 01 00 50 18 00 02 01 00 00 9B
+  |hdr | TP LN |------------- status data (24 bytes total) --------------|
+
+
+===============================================================================
+3. TEXT INIT (CMD = 0x04)
+===============================================================================
+
+Paquete de 13 bytes. Le dice al dispositivo: "viene un bitmap para el slot N".
+Debe enviarse ANTES del bitmap. El SUB y SEQ deben coincidir con el bitmap.
+
+Formato:
+  [0-5]   Magic header
+  [6]     0x0D (13 = tamano total)
+  [7]     0x00
+  [8]     0x04 (CMD = text init)
+  [9]     SUB (ID de slot, ej: 0x03)
+  [10]    SEQ (secuencia, ej: 0x02 o 0x03)
+  [11]    0xFF \_ Siempre FF 00. NO indica color.
+  [12]    0x00 /  El color real esta en el metadata del bitmap.
+
+Ejemplo (hello rojo):
+  99 AA 00 2E FF 88 0D 00 04 03 03 FF 00
+  |-- magic header --| LN 00 CM SB SQ CL
+
+  CMD=0x04, SUB=0x03, SEQ=0x03, color_field=FF00
+
+Ejemplo (BBBB azul):
+  99 AA 00 2E FF 88 0D 00 04 03 02 FF 00
+  |-- magic header --| LN 00 CM SB SQ CL
+
+  CMD=0x04, SUB=0x03, SEQ=0x02, color_field=FF00
+
+NOTA: el campo color (FF 00) es identico para rojo y azul.
+El color real se define en el bitmap metadata (ver seccion 4).
+
+
+Respuesta del dispositivo:
+  88 FF 03 00 00 00 00 00 FF FF 00 0D 95
+  |hdr | TP |---- bitmap ack (13 bytes total) -----|
+
+
+===============================================================================
+4. BITMAP DATA (CMD = 0x07)
+===============================================================================
+
+Paquete de tamano variable. Contiene los datos de pixeles para mostrar.
+El SUB y SEQ deben coincidir con el text_init previo.
+
+Estructura completa:
+
+  Offset  Tam  Campo
+  ------  ---  -----
+  [0-5]    6   Magic header: 99 AA 00 2E FF 88
+  [6]      1   LEN = tamano total del paquete
+  [7]      1   0x00
+  [8]      1   0x07 (CMD = bitmap)
+  [9]      1   SUB (debe coincidir con text_init)
+  [10]     1   SEQ (debe coincidir con text_init)
+
+  --- METADATA (25 bytes, offsets 11-35) ---
+
+  [11-12]  2   bitmap_data_len (LE uint16)
+                 = LEN - 24 (o bien = 12 + paginas * 64)
+  [13]     1   0x00
+  [14]     1   0x02 (constante)
+  [15]     1   0x00
+  [16]     1   0x02 (constante)
+  [17]     1   0x01 (constante)
+  [18]     1   0x00
+  [19]     1   0x00
+  [20]     1   PAGINAS = numero de paginas (1, 2, o 4 observados)
+  [21]     1   0x00
+  [22]     1   0x03 (constante, posiblemente modo de animacion)
+  [23]     1   0x00
+  [24]     1   0x00
+  [25]     1   0x00 (posible campo de color verde, no confirmado)
+  [26]     1   0x00
+
+  --- COLOR (offsets 27-29) ---
+
+  [27]     1   RED   (0x00 = apagado, 0xFF = encendido)
+  [28]     1   GREEN (0x00 = apagado, 0xFF = encendido) [no confirmado]
+  [29]     1   BLUE  (0x00 = apagado, 0xFF = encendido)
+
+  --- DISPLAY CONFIG ---
+
+  [30]     1   0x00
+  [31]     1   0x00
+  [32]     1   0xFF (brillo? siempre 0xFF en capturas)
+  [33]     1   0x00
+  [34]     1   0x3C = 60 (velocidad de scroll o tiempo de display)
+  [35]     1   0x00
+
+  --- PIXEL DATA (offset 36 en adelante) ---
+
+  [36...]  N   Datos de pixeles: PAGINAS * 16 filas * 4 bytes/fila
+
+
+FORMULAS:
+  bitmap_data_len = 12 + (PAGINAS * 64)
+  total_pixel_bytes = PAGINAS * 64
+  total_packet_size = 36 + (PAGINAS * 64)
+
+  | Paginas | bitmap_data_len | Pixel bytes | Packet total |
+  |---------|-----------------|-------------|--------------|
+  |    1    |     76 (0x4C)   |     64      |    100       |
+  |    2    |    140 (0x8C)   |    128      |    164       |
+  |    4    |    268 (0x10C)  |    256      |    292       |
+
+
+FORMATO DE PIXELES:
+  - Cada fila = 4 bytes = 32 bits (LE uint32)
+  - Bit 0 (LSB) = pixel mas a la izquierda
+  - Bit 31 (MSB) = pixel mas a la derecha
+  - Cada pagina = 16 filas (filas 0-15)
+  - Las filas activas son ~1-12 (la fila 0 y las filas 13-15 son padding/ceros)
+  - 1 pagina ~ 2-3 caracteres de ancho en el display
+  - Texto largo se divide en multiples paginas
+
+
+Respuestas del dispositivo (2 notificaciones):
+  88 FF 03 01 00 01 02 00 FF FF 00 0D 99   <- bitmap ack
+  88 FF 05 01 00 00 00 00 00 0B 98          <- command complete
+
+
+===============================================================================
+5. EJEMPLO: HELLO ROJO (2 paginas, 164 bytes)
+===============================================================================
+
+Paquete completo (hex):
+  99aa002eff88 a4 00 07 03 03
+  8c00 0002 0002 0100 0002 0003 0000 0000 ff 00 00 00 ff 00 3c 00
+  0000 0000
+  1800 c006 1800 c006 1800 c006 d881 c306
+  78c3 c606 1866 cc06 1826 c806 18e6 cf06
+  1826 c006 1866 c006 1846 c806 1886 cf06
+  0000 0000 0000 0000 0000 0000 0000 0000
+  0000 0000 0000 0000 0000 0000 00c0 0100
+  0060 0700 0030 0400 0010 0c00 0010 0c00
+  0010 0c00 0030 0c00 0020 0600 00c0 0300
+  0000 0000 0000 0000 0000 0000
+
+Decodificacion del header:
+  LEN     = 0xA4 = 164 bytes total
+  CMD     = 0x07 (bitmap)
+  SUB     = 0x03
+  SEQ     = 0x03
+  Paginas = 2
+  Color   = RED=0xFF, GREEN=0x00, BLUE=0x00 (rojo)
+  Brillo  = 0xFF
+  Speed   = 0x3C = 60
+
+Pagina 0 - Caracteres "hell" (4 letras, fuente proporcional ~24px ancho):
+
+  Row  0: ................................  00000000
+  Row  1: ...##.................##.##.....  1800c006
+  Row  2: ...##.................##.##.....  1800c006
+  Row  3: ...##.................##.##.....  1800c006
+  Row  4: ...##.###......###....##.##.....  d881c306
+  Row  5: ...####.##....##.##...##.##.....  78c3c606
+  Row  6: ...##....##..##...##..##.##.....  1866cc06
+  Row  7: ...##....##..#.....#..##.##.....  1826c806
+  Row  8: ...##....##..#######..##.##.....  18e6cf06
+  Row  9: ...##....##..#........##.##.....  1826c006
+  Row 10: ...##....##..##.......##.##.....  1866c006
+  Row 11: ...##....##...#....#..##.##.....  1846c806
+  Row 12: ...##....##....#####..##.##.....  1886cf06
+  Row 13: ................................  00000000
+  Row 14: ................................  00000000
+  Row 15: ................................  00000000
+
+  Lectura: h (bits 3-10), e (bits 13-20), ll (bits 22-27)
+  La "h" tiene el trazo vertical izquierdo (bits 3-4) y la curva derecha.
+  Las dos "l" se ven como lineas verticales paralelas en los bits 22-23 y 26-27.
+
+Pagina 1 - Caracter "o" (1 letra, centrada):
+
+  Row  0: ................................  00000000
+  Row  1: ................................  00000000
+  Row  2: ................................  00000000
+  Row  3: ................................  00000000
+  Row  4: ..............###...............  00c00100
+  Row  5: .............##.###.............  00600700
+  Row  6: ............##....#.............  00300400
+  Row  7: ............#.....##............  00100c00
+  Row  8: ............#.....##............  00100c00
+  Row  9: ............#.....##............  00100c00
+  Row 10: ............##....##............  00300c00
+  Row 11: .............#...##.............  00200600
+  Row 12: ..............####..............  00c00300
+  Row 13: ................................  00000000
+  Row 14: ................................  00000000
+  Row 15: ................................  00000000
+
+  La "o" ocupa bits 12-21, ~9px de ancho.
+  Las filas activas son 4-12 (9 filas de alto).
+
+
+===============================================================================
+6. EJEMPLO: BBBB AZUL (2 paginas, 164 bytes)
+===============================================================================
+
+Paquete completo (hex):
+  99aa002eff88 a4 00 07 03 02
+  8c00 0002 0002 0100 0002 0003 0000 0000 00 00 ff 00 00 ff 00 3c
+  0000 0000
+  fcf0 c30f 8411 4618 0411 4410 8411 4618
+  fcf0 c30f fcf0 c30f 0411 4410 0413 4c30
+  0411 4410 8411 4618 fcf0 c30f 0000 0000
+  0000 0000 0000 0000 0000 0000
+  0000 0000 00f0 0300 0010 0600 0010 0400
+  0010 0600 00f0 0300 00f0 0300 0010 0400
+  0010 0c00 0010 0400 0010 0600 00f0 0300
+  0000 0000 0000 0000 0000 0000
+
+Decodificacion del header:
+  LEN     = 0xA4 = 164 bytes total
+  CMD     = 0x07 (bitmap)
+  SUB     = 0x03
+  SEQ     = 0x02
+  Paginas = 2
+  Color   = RED=0x00, GREEN=0x00, BLUE=0xFF (azul)
+  Brillo  = 0xFF (en offset 32... ver nota abajo)
+  Speed   = 0x3C = 60
+
+NOTA sobre color: comparando HELLO rojo vs BBBB azul:
+  Offset 27: FF (rojo) vs 00 (azul)  <- RED
+  Offset 28: 00 vs 00                <- GREEN (no usado en estos ejemplos)
+  Offset 29: 00 (rojo) vs FF (azul)  <- BLUE
+  El byte en offset 32 es FF en ambos, no parece ser color.
+
+Pagina 0 - Caracteres "BBB" (3 letras, ~10px cada una):
+
+  Row  0: ................................  00000000
+  Row  1: ..######....######....######....  fcf0c30f
+  Row  2: ..#....##...#....##...#....##...  84114618
+  Row  3: ..#.....#...#.....#...#.....#...  04114410
+  Row  4: ..#....##...#....##...#....##...  84114618
+  Row  5: ..######....######....######....  fcf0c30f
+  Row  6: ..######....######....######....  fcf0c30f
+  Row  7: ..#.....#...#.....#...#.....#...  04114410
+  Row  8: ..#.....##..#.....##..#.....##..  04134c30
+  Row  9: ..#.....#...#.....#...#.....#...  04114410
+  Row 10: ..#....##...#....##...#....##...  84114618
+  Row 11: ..######....######....######....  fcf0c30f
+  Row 12: ................................  00000000
+  Row 13: ................................  00000000
+  Row 14: ................................  00000000
+  Row 15: ................................  00000000
+
+  Cada "B" ocupa ~8px de ancho con ~2px de espacio.
+  B1: bits 2-9, B2: bits 12-19, B3: bits 22-29
+  La forma tiene doble barra horizontal (rows 5-6) donde se unen
+  las mitades superior e inferior de la B.
+
+Pagina 1 - Caracter "B" (1 letra):
+
+  Row  0: ................................  00000000
+  Row  1: ............######..............  00f00300
+  Row  2: ............#....##.............  00100600
+  Row  3: ............#.....#.............  00100400
+  Row  4: ............#....##.............  00100600
+  Row  5: ............######..............  00f00300
+  Row  6: ............######..............  00f00300
+  Row  7: ............#.....#.............  00100400
+  Row  8: ............#.....##............  00100c00
+  Row  9: ............#.....#.............  00100400
+  Row 10: ............#....##.............  00100600
+  Row 11: ............######..............  00f00300
+  Row 12: ................................  00000000
+  Row 13: ................................  00000000
+  Row 14: ................................  00000000
+  Row 15: ................................  00000000
+
+  La cuarta "B" esta centrada en bits 12-19 de la pagina 1.
+  Division de texto: BBBB -> BBB (pagina 0) + B (pagina 1).
+
+
+===============================================================================
+7. SECUENCIA DE ENVIO (MODO PREVIEW)
+===============================================================================
+
+Este es el metodo confirmado para mostrar texto en el dispositivo:
+
+  1. Conectar por BLE
+  2. Activar notificaciones (handle 131 en bleak)
+  3. Enviar HANDSHAKE (cmd 0x00, 31 bytes)
+     -> Esperar notificacion 88 FF 00... (status, 24 bytes)
+  4. Enviar TEXT INIT (cmd 0x04, 13 bytes)
+     -> Esperar notificacion 88 FF 03... (bitmap ack, 13 bytes)
+  5. Enviar BITMAP (cmd 0x07, tamano variable)
+     -> Esperar notificacion 88 FF 03... (bitmap ack)
+     -> Esperar notificacion 88 FF 05... (command complete)
+
+El dispositivo muestra el contenido inmediatamente.
+Para cambiar el texto, repetir pasos 3-5 sin desconectar.
+
+NOTA: el handshake contiene un timestamp y hash. En la practica,
+se puede reenviar uno capturado previamente y funciona igual.
+No parece haber verificacion estricta.
+
+
+===============================================================================
+8. DISPLAY ON / OFF (CMD = 0x11)
+===============================================================================
+
+Para encender/apagar el display sin enviar contenido:
+
+  ON:   99 AA 00 2E FF 88 12 00 11 00 [SEQ] 01 01 01 00 00 00 00
+  OFF:  99 AA 00 2E FF 88 12 00 11 00 [SEQ] 02 01 01 00 00 00 00
+
+  LEN = 0x12 = 18 bytes total
+  CMD = 0x11 (display control)
+  Payload ON:  01 01 01 00 00 00 00
+  Payload OFF: 02 01 01 00 00 00 00
+
+Confirmado funcionando desde Python (xyaoled_onoff.py).
+
+NOTA: este comando NO es necesario para el modo preview.
+El preview funciona independientemente del estado on/off.
+
+
+===============================================================================
+9. RESUMEN DE COLORES CONFIRMADOS
+===============================================================================
+
+  Color     Offset 27 (R)  Offset 28 (G)  Offset 29 (B)
+  --------  -------------  -------------  -------------
+  Rojo      0xFF           0x00           0x00
+  Azul      0x00           0x00           0xFF
+  Verde     0x00           0xFF?          0x00           (no confirmado)
+
+  Para colores mixtos (amarillo, cyan, etc.) posiblemente se combinan
+  los canales, pero esto no ha sido probado aun.
+
+  El campo "color" del text_init (bytes 11-12 = FF 00) NO indica color.
+  Es constante en todas las capturas.
+
+
+===============================================================================
+10. PREGUNTAS PENDIENTES
+===============================================================================
+
+  1. El handshake: se necesita realmente? Que pasa si no lo enviamos?
+  2. El campo GREEN (offset 28): funciona como esperamos?
+  3. El offset 32 (siempre 0xFF): es brillo? Se puede cambiar?
+  4. El offset 34 (0x3C = 60): es velocidad de scroll? Unidades?
+  5. Se pueden mezclar colores (R+G, R+B, R+G+B)?
+  6. Que hace el cmd 0x12 que aparecio en una captura de preview?
+  7. Como se genera la fuente? El app usa Android Canvas con fuente
+     proporcional de ~11px de alto. Necesitamos replicar eso o podemos
+     usar cualquier fuente/bitmap?

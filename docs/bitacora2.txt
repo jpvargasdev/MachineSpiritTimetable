@@ -1,0 +1,136 @@
+BITACORA 2 - Descubrimiento del modo Preview y envio de texto
+=============================================================
+Fecha: Feb 20, 2026 (sesion 2)
+
+CONTEXTO
+--------
+Al iniciar esta sesion, teniamos:
+  - ON/OFF funcionando desde Python
+  - Tres capturas limpias (BBBB, CCCC, ABCDEFGHI)
+  - Formato de bitmap parcialmente decodificado
+  - Replay de capturas NO funcionaba de manera confiable
+
+El objetivo era lograr mostrar texto en el dispositivo desde Python.
+
+
+INTENTO 1: Secuencia minima (4 comandos)
+-----------------------------------------
+Hipotesis: solo necesitamos ON -> handshake -> text_init -> bitmap
+
+Resultado: el dispositivo acepto todos los paquetes (acks correctos:
+88ff03 bitmap ack + 88ff05 complete ack), PERO mostro "HI" (datos
+cacheados de una sesion anterior del app), no nuestro bitmap nuevo.
+
+Conclusion: el bitmap se almaceno pero NO se activo. Faltan comandos
+post-bitmap para decirle al dispositivo que muestre el contenido nuevo.
+
+
+INTENTO 2: Secuencia completa (8 comandos del capture BBCC)
+------------------------------------------------------------
+Replicamos los 8 comandos exactos de la sesion 1 del capture BBCC:
+  1. Turn ON (cmd 0x11, payload 01 01 01 00 00 00 00)
+  2. Handshake (cmd 0x00)
+  3. Text init (cmd 0x04, slot 02)
+  4. Bitmap (cmd 0x07, BBBB 1 pagina)
+  5. Config (cmd 0x0a, seq 03)
+  6. Cmd 0x06 #1 (seq 04, payload 020000000000)
+  7. Cmd 0x06 #2 (seq 05, payload 020000000000)
+  8. Display ctrl (cmd 0x11, seq 06, payload 02 01 01 00 00 00 00)
+
+Resultado: mostro "HI" brevemente, luego se APAGO.
+
+Analisis: el comando final (display ctrl con payload 02 01 01...) es
+identico al comando OFF de xyaoled_onoff.py. Ademas, el dispositivo
+asigno nuestro bitmap a slots 3/4 (no 2 como esperabamos) porque ya
+tenia datos previos. El text_init ack devolvio seq=0003 en vez de 0002.
+
+Conclusion: el modo "playlist/store" es complejo — maneja slots
+internos, requiere limpiar slots viejos, y el display_ctrl final
+puede apagar el dispositivo dependiendo del contexto.
+
+
+DESCUBRIMIENTO: Modo Preview
+-----------------------------
+Analizando una nueva captura donde el usuario envio "hello" en rojo
+usando el boton Preview del app (no Store), descubrimos que el modo
+preview usa una secuencia MUCHO mas simple:
+
+  1. Handshake (cmd 0x00)
+  2. Text init (cmd 0x04)
+  3. Bitmap (cmd 0x07)
+
+Solo 3 comandos. Sin ON/OFF, sin display_ctrl, sin cmd 0x06.
+El dispositivo muestra el contenido inmediatamente al recibir el bitmap.
+
+En una de las capturas tambien aparecio un cmd 0x12 entre el handshake
+y el text_init, pero en capturas posteriores no aparecio. No es
+necesario para el preview.
+
+
+PRUEBAS EXITOSAS
+-----------------
+  1. HELLO rojo (replay exacto del capture preview) -> FUNCIONO
+  2. BBBB azul (replay exacto del capture preview)  -> FUNCIONO
+  3. HELLO rojo + BBBB azul secuencial (misma conexion, 5s entre
+     ambos) -> FUNCIONO, el display cambio de uno a otro
+
+Confirmado: el modo preview es el camino a seguir para enviar
+texto programaticamente. Se pueden enviar multiples items en una
+sola conexion BLE, cada uno reemplaza al anterior en el display.
+
+
+CORRECCIONES A BITACORA 1
+--------------------------
+  1. El metadata header del bitmap NO es de 28 bytes, es de 25 bytes.
+     Los datos de pixel empiezan en el offset 36 del paquete (no 39).
+
+  2. Los colores NO son LE uint16. Son bytes individuales:
+     - Offset 27: RED   (0x00 o 0xFF)
+     - Offset 28: GREEN (0x00 o 0xFF, no confirmado aun)
+     - Offset 29: BLUE  (0x00 o 0xFF)
+     Los bytes intermedios (offsets 26, 28 en la interpretacion vieja)
+     son padding/ceros, no parte de un uint16.
+
+  3. El campo "color" del text_init (ultimos 2 bytes: ff 00) es
+     SIEMPRE ff 00 independientemente del color real. No indica color.
+     El color real esta SOLO en el metadata del bitmap.
+
+  4. LEN (offset 6) = tamano total del paquete, no solo el payload
+     despues del header.
+     Ejemplo: paquete de 164 bytes -> LEN = 0xA4 = 164.
+
+  5. Formula del bitmap: bitmap_data_len (offset 11-12) = 12 + (paginas * 64)
+     Pixel data = paginas * 16 filas * 4 bytes/fila
+
+
+CAPTURAS NUEVAS
+----------------
+  btsnoop_preview.log      - hello rojo (preview) + sesiones anteriores
+  btsnoop_bbbb_preview.log - BBBB rojo (preview, pero resulto ser azul)
+  btsnoop_bbbb_blue.log    - confirmacion del BBBB azul
+
+
+SECUENCIA DE ENVIO (PREVIEW MODE)
+----------------------------------
+Para mostrar texto en el display usando preview:
+
+  1. Conectar por BLE al dispositivo
+  2. Activar notificaciones en handle 131 (bleak) / 0x0084 (HCI)
+  3. Enviar handshake (cmd 0x00, 31 bytes) -> esperar notify 88ff00...
+  4. Enviar text_init (cmd 0x04, 13 bytes) -> esperar notify 88ff03...
+  5. Enviar bitmap (cmd 0x07, variable) -> esperar notify 88ff03 + 88ff05
+
+El dispositivo muestra el contenido inmediatamente despues del paso 5.
+Para cambiar el contenido, repetir pasos 3-5 en la misma conexion.
+
+
+SIGUIENTE PASO
+--------------
+Ahora que podemos enviar bitmaps capturados, el siguiente paso es
+GENERAR nuestros propios bitmaps desde texto arbitrario:
+  - Renderizar texto a una grilla de pixeles (16 filas, ancho variable)
+  - Empaquetar en el formato de metadata + pixel data
+  - Controlar color (R/G/B) y velocidad de scroll
+  - Manejar texto largo (multiples paginas)
+
+Ver docs/formato.txt para la referencia completa del formato de paquetes.
