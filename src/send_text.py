@@ -6,11 +6,15 @@ Usage:
     python3 send_text.py "Hello" --color red
     python3 send_text.py "Test" --color blue --size large
     python3 send_text.py "Hi" --color green
+    python3 send_text.py "AAAA" --scroll              # scrolling text
+    python3 send_text.py "Hello" --scroll --color blue
     python3 send_text.py "ABC" --preview   # just show ASCII art, don't send
 
 The text is rendered using a built-in 5x7 bitmap font (with optional 2x
 scaling for large size), split into 32-column pages, and sent using the
 Preview protocol (3 commands: handshake, text_init, bitmap).
+
+Scroll mode enables left-to-right scrolling animation on the display.
 """
 
 import argparse
@@ -21,7 +25,7 @@ import sys
 from bleak import BleakClient
 
 # ── Device constants ──────────────────────────────────────────────────
-DEVICE_ADDRESS = "01DC102F-B8D9-1ACB-2353-441F394DA3A3"
+DEVICE_ADDRESS = "84B8D1EA-C675-2DAA-8C2C-0D5D0A96D0A8"
 WRITE_HANDLE = 129
 NOTIFY_HANDLE = 131
 
@@ -36,7 +40,7 @@ MAGIC = bytes.fromhex("99aa002eff88")
 # Row values: MSB = leftmost pixel within the glyph
 FONT = {
     # ── Uppercase (mostly 5-wide, some 6) ──
-    'A': (5, [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11]),
+    'A': (4, [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11]),
     'B': (5, [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E]),
     'C': (5, [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E]),
     'D': (5, [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E]),
@@ -132,7 +136,7 @@ PAGE_WIDTH = 32   # bits per page
 # Vertical offsets per scale to center the font in 16 rows:
 #   1x: 7 rows tall  -> offset 4 (rows 4-10, 4 above + 2 below)
 #   2x: 14 rows tall -> offset 1 (rows 1-14, 1 above + 1 below)
-V_OFFSETS = {1: 4, 2: 1}
+V_OFFSETS = {1: 9, 0: 1}
 
 
 # ── Color presets ─────────────────────────────────────────────────────
@@ -276,7 +280,8 @@ def build_text_init(sub: int = 0x03, seq: int = 0x02) -> bytes:
 
 def build_bitmap(pages: list[list[int]], color: tuple[int, int, int],
                  sub: int = 0x03, seq: int = 0x02,
-                 brightness: int = 0xFF, speed: int = 0x3C) -> bytes:
+                 brightness: int = 0xFF, speed: int = 0x3C,
+                 scroll: bool = False) -> bytes:
     """Build a bitmap packet (cmd 0x07, variable size).
 
     Args:
@@ -286,6 +291,7 @@ def build_bitmap(pages: list[list[int]], color: tuple[int, int, int],
         seq: Sequence number (must match text_init)
         brightness: Brightness value (default 0xFF)
         speed: Scroll speed (default 0x3C = 60)
+        scroll: Enable scrolling animation (default False = static)
 
     Returns:
         Complete bitmap packet bytes
@@ -295,6 +301,12 @@ def build_bitmap(pages: list[list[int]], color: tuple[int, int, int],
     total_packet_size = 36 + (num_pages * 64)
 
     r, g, b = color
+    
+    # Scroll control (discovered from HCI capture Feb 22, 2026)
+    # offset 22: mode (0x00 = scroll, 0x03 = static)
+    # offset 33: scroll flag (0x01 = scroll active, 0x00 = static)
+    mode_byte = 0x00 if scroll else 0x03
+    scroll_flag = 0x01 if scroll else 0x00
 
     # Build packet
     pkt = bytearray(MAGIC)
@@ -318,7 +330,7 @@ def build_bitmap(pages: list[list[int]], color: tuple[int, int, int],
     pkt.append(0x00)       # [19]
     pkt.append(num_pages)  # [20] page count
     pkt.append(0x00)       # [21]
-    pkt.append(0x03)       # [22] animation mode?
+    pkt.append(mode_byte)  # [22] MODE: 0x00=scroll, 0x03=static
     pkt.append(0x00)       # [23]
     pkt.append(0x00)       # [24]
     pkt.append(0x00)       # [25]
@@ -329,7 +341,7 @@ def build_bitmap(pages: list[list[int]], color: tuple[int, int, int],
     pkt.append(0x00)       # [30]
     pkt.append(0x00)       # [31]
     pkt.append(brightness) # [32] brightness
-    pkt.append(0x00)       # [33]
+    pkt.append(scroll_flag)# [33] SCROLL: 0x01=on, 0x00=off
     pkt.append(speed)      # [34] speed
     pkt.append(0x00)       # [35]
 
@@ -377,7 +389,8 @@ async def send_packet(client, label, pkt):
 
 
 async def send_text(text: str, color: tuple[int, int, int] = (0xFF, 0x00, 0x00),
-                    preview_only: bool = False, scale: int = 1):
+                    preview_only: bool = False, scale: int = 1,
+                    scroll: bool = False):
     """Render text and send to device via Preview mode.
 
     Args:
@@ -385,6 +398,7 @@ async def send_text(text: str, color: tuple[int, int, int] = (0xFF, 0x00, 0x00),
         color: (R, G, B) color tuple
         preview_only: If True, just show ASCII art, don't send
         scale: 1 = small (5x7), 2 = large (10x14)
+        scroll: Enable scrolling animation (left to right)
     """
     # Render
     pages = render_text_to_pages(text, scale=scale)
@@ -392,6 +406,7 @@ async def send_text(text: str, color: tuple[int, int, int] = (0xFF, 0x00, 0x00),
     print(f"Text: '{text}'")
     print(f"Color: R={color[0]:02X} G={color[1]:02X} B={color[2]:02X}")
     print(f"Size: {size_label}")
+    print(f"Scroll: {scroll}")
     print(f"Pages: {len(pages)}")
     print()
     print(pages_to_ascii(pages))
@@ -402,7 +417,7 @@ async def send_text(text: str, color: tuple[int, int, int] = (0xFF, 0x00, 0x00),
     # Build packets
     handshake = build_handshake()
     text_init = build_text_init(sub=0x03, seq=0x02)
-    bitmap = build_bitmap(pages, color, sub=0x03, seq=0x02)
+    bitmap = build_bitmap(pages, color, sub=0x03, seq=0x02, scroll=scroll)
 
     print(f"Bitmap packet: {len(bitmap)} bytes")
     print()
@@ -439,13 +454,16 @@ def main():
     parser.add_argument("--size", "-s", default="small",
                         choices=["small", "large"],
                         help="Font size: small (5x7) or large (10x14, 2x scaled)")
+    parser.add_argument("--scroll", action="store_true",
+                        help="Enable scrolling animation (left to right)")
     parser.add_argument("--preview", "-p", action="store_true",
                         help="Preview only (don't send to device)")
     args = parser.parse_args()
 
     color = COLORS[args.color]
     scale = 2 if args.size == "large" else 1
-    asyncio.run(send_text(args.text, color, preview_only=args.preview, scale=scale))
+    asyncio.run(send_text(args.text, color, preview_only=args.preview, scale=scale,
+                          scroll=args.scroll))
 
 
 if __name__ == "__main__":
