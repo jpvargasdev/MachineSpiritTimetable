@@ -45,20 +45,33 @@ async def run_departure_display(
     interval: int = 30,
     color: str = "red",
     preview: bool = False,
-    scroll: bool = False
+    scroll: bool = False,
+    font: str = "small"
 ):
     """Run the departure display loop.
     
+    Alternates between destinations:
+    - ROPSTEN: 10 seconds (shows next 2 departures)
+    - NORSBORG: 5 seconds (shows next 2 departures)
+    
     Args:
         site_id: SL site ID
-        interval: Refresh interval in seconds
+        interval: API refresh interval in seconds
         color: Display color
         preview: Preview mode (no device)
+        scroll: Enable scroll animation
+        font: Font size - small/medium (2 lines) or large (1 line)
     """
     global running
     
     api = SLApi()
     screen = Screen() if not preview else None
+    
+    # Destinations to show and their display durations
+    DESTINATIONS = [
+        ("Ropsten", 10),    # (destination_name, display_seconds)
+        ("Norsborg", 5),
+    ]
     
     try:
         if screen:
@@ -69,45 +82,107 @@ async def run_departure_display(
         print(f"Fetching departures for site {site_id} every {interval}s")
         print("Press Ctrl+C to stop\n")
         
+        cached_departures = None
+        last_fetch = 0
+        
         while running:
             try:
-                # Fetch departures
-                response = await api.get_departures(site_id)
+                # Fetch departures if cache expired
+                import time
+                now = time.time()
+                if cached_departures is None or (now - last_fetch) >= interval:
+                    print(f"Fetching departures...")
+                    cached_departures = await api.get_departures(site_id)
+                    last_fetch = now
+                    print(f"Got {len(cached_departures.departures)} departures")
                 
-                # Format first departure as line 1
-                if response.departures:
-                    dep1 = response.departures[0]
-                    line1 = f"{dep1.destination}"
-                    line2 = f"{dep1.display}"
-                else:
-                    line1 = "No departures"
-                    line2 = ""  
+                # Group departures by destination
+                departures_by_dest = {}
+                for dep in cached_departures.departures:
+                    dest = dep.destination
+                    if dest not in departures_by_dest:
+                        departures_by_dest[dest] = []
+                    departures_by_dest[dest].append(dep)
                 
-                print(f"[{response.stop_name or site_id}] {line1} | {line2}")
-                
-                # Always show ASCII preview in terminal
-                temp_screen = Screen()
-                ascii_art = await temp_screen.render_two_lines(line1, line2, color=color, use_medium=True, preview=True)
-                print(ascii_art)
-                
-                if screen:
-                    # Send to device with scroll animation
-                    await screen.render_two_lines(
-                        line1, line2,
-                        color=color,
-                        scroll=scroll,
-                        use_medium=True,
-                    )
-
-                             
+                # Cycle through destinations
+                for dest_name, display_duration in DESTINATIONS:
+                    if not running:
+                        break
+                    
+                    # Find departures for this destination
+                    deps = departures_by_dest.get(dest_name, [])
+                    
+                    if font == "large":
+                        # Single line mode
+                        if deps:
+                            line1 = f"{dest_name} {deps[0].display}"
+                        else:
+                            line1 = f"{dest_name} --"
+                        
+                        print(f"\n[{dest_name}] {line1}")
+                        
+                        # Show ASCII preview
+                        temp_screen = Screen()
+                        ascii_art = await temp_screen.render(line1, color=color, preview=True)
+                        print(ascii_art)
+                        
+                        # Send to device
+                        if screen:
+                            await screen.render(
+                                line1,
+                                color=color,
+                                scroll=scroll,
+                            )
+                    else:
+                        # Two line mode (small or medium)
+                        use_medium = font == "medium"
+                        
+                        if use_medium:
+                            # Medium: Line 1 = destination, Line 2 = time1 - time2
+                            line1 = dest_name
+                            if len(deps) >= 2:
+                                line2 = f"{deps[0].display} - {deps[1].display}"
+                            elif len(deps) == 1:
+                                line2 = deps[0].display
+                            else:
+                                line2 = "--"
+                        else:
+                            # Small: Both lines show destination + time
+                            if len(deps) >= 2:
+                                line1 = f"{dest_name} {deps[0].display}"
+                                line2 = f"{dest_name} {deps[1].display}"
+                            elif len(deps) == 1:
+                                line1 = f"{dest_name} {deps[0].display}"
+                                line2 = ""
+                            else:
+                                line1 = dest_name
+                                line2 = "No departures"
+                        
+                        print(f"\n[{dest_name}] {line1} | {line2}")
+                        
+                        # Show ASCII preview
+                        temp_screen = Screen()
+                        ascii_art = await temp_screen.render_two_lines(line1, line2, color=color, use_medium=use_medium, preview=True)
+                        print(ascii_art)
+                        
+                        # Send to device
+                        if screen:
+                            await screen.render_two_lines(
+                                line1, line2,
+                                color=color,
+                                scroll=scroll,
+                                use_medium=use_medium,
+                            )
+                    
+                    # Wait for display duration
+                    for _ in range(display_duration):
+                        if not running:
+                            break
+                        await asyncio.sleep(1)
+                              
             except Exception as e:
                 print(f"Error: {e}")
-            
-            # Wait for next refresh
-            for _ in range(interval):
-                if not running:
-                    break
-                await asyncio.sleep(1)
+                await asyncio.sleep(5)
     
     finally:
         await api.close()
@@ -195,6 +270,9 @@ async def main():
     # Departure mode options
     parser.add_argument("--interval", "-i", type=int, default=30,
                         help="Refresh interval in seconds (default: 30)")
+    parser.add_argument("--font", "-f", default="small",
+                        choices=["small", "medium", "large"],
+                        help="Font size: small (2 lines), medium (2 lines), large (1 line)")
     
     # Text mode options
     parser.add_argument("--size", "-s", default="small",
@@ -216,7 +294,9 @@ async def main():
             site_id=args.site,
             interval=args.interval,
             color=args.color,
-            preview=args.preview
+            preview=args.preview,
+            scroll=args.scroll,
+            font=args.font,
         )
     else:
         # Manual text mode
