@@ -6,7 +6,23 @@ services:
     volumes:
       - ./:/app
       - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/dbus:/var/run/dbus
     environment:
       ENV: "debug"
+      DBUS_SYSTEM_BUS_ADDRESS: "unix:path=/var/run/dbus/system_bus_socket"
+    network_mode: host
+    privileged: true
     container_name: xyaod
     command: ["air", "-c", ".air.toml"]
+
+  xyaod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - /var/run/dbus:/var/run/dbus
+    environment:
+      DBUS_SYSTEM_BUS_ADDRESS: "unix:path=/var/run/dbus/system_bus_socket"
+    network_mode: host
+    privileged: true
+    container_name: xyaod-prod

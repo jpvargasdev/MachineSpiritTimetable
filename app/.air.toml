@@ -4,7 +4,7 @@ tmp_dir = "tmp" # Directorio temporal para builds
 
 [build]
   bin = "tmp/main" # Archivo binario temporal
-  cmd = "go build -o tmp/main ./main.go" # Comando para compilar
+  cmd = "go build -o tmp/main ." # Comando para compilar
   include_ext = ["go", "tpl", "tmpl", "html"] # Archivos a observar para cambios
   exclude_dir = ["vendor", "tmp"] # Directorios a ignorar
   delay = 1000 # Milisegundos antes de reiniciar
@@ -19,5 +19,4 @@ tmp_dir = "tmp" # Directorio temporal para builds
 [screen]
   clear = true # Limpiar la pantalla en cada reinicio
 [proxy]
-  enabled = true
-  app_port = 8080
+  enabled = false

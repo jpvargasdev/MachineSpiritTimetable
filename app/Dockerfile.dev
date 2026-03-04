@@ -4,7 +4,8 @@ FROM golang:1.25-alpine
 RUN apk add --no-cache \
   bash git curl jq openssl \
   docker-cli docker-cli-compose \
-  sops
+  sops \
+  dbus bluez bluez-dev
 
 WORKDIR /app
 
