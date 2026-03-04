@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -83,7 +84,18 @@ func main() {
 	textCmd.Flags().IntVar(&brightness, "brightness", 255, "Brightness 0-255")
 	textCmd.Flags().StringVar(&tAddress, "address", "", "BLE device address (default: built-in)")
 
-	root.AddCommand(departureCmd, textCmd)
+	// ── serve mode ─────────────────────────────────────────────────────
+	var httpAddr string
+	serveCmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Start HTTP server with health endpoint",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runServe(httpAddr)
+		},
+	}
+	serveCmd.Flags().StringVar(&httpAddr, "addr", ":8080", "HTTP listen address")
+
+	root.AddCommand(departureCmd, textCmd, serveCmd)
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -274,6 +286,32 @@ func runText(_ context.Context, text, color, size string, scroll, preview bool, 
 	log.Println("Sent!")
 	time.Sleep(2 * time.Second)
 	return nil
+}
+
+// ── serve ──────────────────────────────────────────────────────────────────
+
+func runServe(addr string) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+
+	go func() {
+		log.Printf("Server listening on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("http server: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-quit
+	log.Println("Shutting down...")
+	return srv.Close()
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────

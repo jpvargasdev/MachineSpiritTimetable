@@ -5,6 +5,7 @@ tmp_dir = "tmp" # Directorio temporal para builds
 [build]
   bin = "tmp/main" # Archivo binario temporal
   cmd = "go build -o tmp/main ." # Comando para compilar
+  full_bin = "tmp/main serve"
   include_ext = ["go", "tpl", "tmpl", "html"] # Archivos a observar para cambios
   exclude_dir = ["vendor", "tmp"] # Directorios a ignorar
   delay = 1000 # Milisegundos antes de reiniciar

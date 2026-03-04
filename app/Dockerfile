@@ -21,4 +21,8 @@ WORKDIR /app
 
 COPY --from=builder /app/xyaod .
 
+# Expose ports for Go app
+EXPOSE 8080
+
 ENTRYPOINT ["./xyaod"]
+
