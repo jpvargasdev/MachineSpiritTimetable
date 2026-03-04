@@ -1,0 +1,99 @@
+name: Publish image to GHCR and create Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-publish-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute tag variants
+        id: tagvars
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}"
+          TAG="${GITHUB_REF_NAME}"
+          NO_V="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag_no_v=${NO_V}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_semver=${IMAGE}:${NO_V}" >> "$GITHUB_OUTPUT"
+          echo "image_latest=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (labels only)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: ""
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ steps.tagvars.outputs.image_tag }}
+            ${{ steps.tagvars.outputs.image_semver }}
+            ${{ steps.tagvars.outputs.image_latest }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Compose image refs
+        id: refs
+        run: |
+          DIGEST="${{ steps.build.outputs.digest }}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_by_digest=${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            ## Release ${{ steps.tagvars.outputs.tag }}
+
+            Container image references:
+
+            - By tag: `${{ steps.tagvars.outputs.image_tag }}`
+            - By semver (no v): `${{ steps.tagvars.outputs.image_semver }}`
+            - By digest (immutable): `${{ steps.refs.outputs.image_by_digest }}`
+            - Digest: `${{ steps.refs.outputs.digest }}`
+
+            _Built from commit_ `${{ github.sha }}`.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
