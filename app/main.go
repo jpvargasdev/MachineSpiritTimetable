@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -117,22 +116,49 @@ var destinations = []destination{
 func runDepartures(ctx context.Context, siteID, interval int, color, font string, scroll, preview bool, address string) error {
 	slApi := api.NewSLApi()
 
-	var screen *display.Screen
-	if !preview {
-		screen = display.NewScreen(address)
-		log.Println("Connecting to LED display...")
-		if err := screen.Connect(); err != nil {
-			return fmt.Errorf("connect: %w", err)
-		}
-		log.Println("Connected!")
-		defer func() {
-			screen.Disconnect()
-			log.Println("Disconnected.")
-		}()
+	// Preview mode — no BLE needed
+	if preview {
+		return runDeparturesPreview(ctx, slApi, siteID, interval, color, font, scroll)
 	}
 
-	log.Printf("Fetching departures for site %d every %ds\n", siteID, interval)
+	// Real mode — connect with automatic reconnect on device power loss
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 
+		screen := display.NewScreen(address)
+		if err := screen.Connect(); err != nil {
+			// Device not found — wait and retry
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(5 * time.Minute):
+			}
+			continue
+		}
+
+		err := runDeparturesLoop(ctx, slApi, screen, siteID, interval, color, font, scroll)
+		screen.Disconnect()
+
+		if err == nil || ctx.Err() != nil {
+			return nil
+		}
+		// BLE error (device powered off) — retry after 5 min
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(5 * time.Minute):
+		}
+	}
+}
+
+// errBLE is returned when a BLE write fails so the outer loop can reconnect.
+var errBLE = fmt.Errorf("ble error")
+
+func runDeparturesLoop(ctx context.Context, slApi *api.SLApi, screen *display.Screen, siteID, interval int, color, font string, scroll bool) error {
 	var cachedResp *api.DeparturesResponse
 	var lastFetch time.Time
 
@@ -143,12 +169,9 @@ func runDepartures(ctx context.Context, siteID, interval int, color, font string
 		default:
 		}
 
-		// Refresh cache if expired
 		if cachedResp == nil || time.Since(lastFetch) >= time.Duration(interval)*time.Second {
-			log.Println("Fetching departures...")
 			resp, err := slApi.GetDepartures(siteID, "METRO")
 			if err != nil {
-				log.Printf("API error: %v — retrying in 5s\n", err)
 				select {
 				case <-ctx.Done():
 					return nil
@@ -158,16 +181,103 @@ func runDepartures(ctx context.Context, siteID, interval int, color, font string
 			}
 			cachedResp = resp
 			lastFetch = time.Now()
-			log.Printf("Got %d departures\n", len(cachedResp.Departures))
 		}
 
-		// Group by destination
 		byDest := map[string][]api.Departure{}
 		for _, d := range cachedResp.Departures {
 			byDest[d.Destination] = append(byDest[d.Destination], d)
 		}
 
-		// Cycle through destinations
+		for _, dest := range destinations {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+
+			deps := byDest[dest.name]
+			var line1, line2 string
+			var renderErr error
+
+			switch font {
+			case "large":
+				if len(deps) > 0 {
+					line1 = fmt.Sprintf("%s %s", dest.name, deps[0].Display)
+				} else {
+					line1 = fmt.Sprintf("%s --", dest.name)
+				}
+				_, renderErr = screen.Render(line1, color, scroll, 60, 255, 1, false)
+
+			case "medium":
+				line1 = dest.name
+				switch len(deps) {
+				case 0:
+					line2 = "--"
+				case 1:
+					line2 = deps[0].Display
+				default:
+					line2 = fmt.Sprintf("%s - %s", deps[0].Display, deps[1].Display)
+				}
+				_, renderErr = screen.RenderTwoLines(line1, line2, color, scroll, 60, 255, true, false)
+
+			default: // small
+				switch len(deps) {
+				case 0:
+					line1, line2 = dest.name, "No departures"
+				case 1:
+					line1, line2 = fmt.Sprintf("%s %s", dest.name, deps[0].Display), ""
+				default:
+					line1 = fmt.Sprintf("%s %s", dest.name, deps[0].Display)
+					line2 = fmt.Sprintf("%s %s", dest.name, deps[1].Display)
+				}
+				_, renderErr = screen.RenderTwoLines(line1, line2, color, scroll, 60, 255, false, false)
+			}
+
+			if renderErr != nil {
+				return errBLE
+			}
+
+			for i := 0; i < dest.seconds; i++ {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(time.Second):
+				}
+			}
+		}
+	}
+}
+
+func runDeparturesPreview(ctx context.Context, slApi *api.SLApi, siteID, interval int, color, font string, scroll bool) error {
+	var cachedResp *api.DeparturesResponse
+	var lastFetch time.Time
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		if cachedResp == nil || time.Since(lastFetch) >= time.Duration(interval)*time.Second {
+			resp, err := slApi.GetDepartures(siteID, "METRO")
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(5 * time.Second):
+				}
+				continue
+			}
+			cachedResp = resp
+			lastFetch = time.Now()
+		}
+
+		byDest := map[string][]api.Departure{}
+		for _, d := range cachedResp.Departures {
+			byDest[d.Destination] = append(byDest[d.Destination], d)
+		}
+
 		for _, dest := range destinations {
 			select {
 			case <-ctx.Done():
@@ -185,15 +295,8 @@ func runDepartures(ctx context.Context, siteID, interval int, color, font string
 				} else {
 					line1 = fmt.Sprintf("%s --", dest.name)
 				}
-				log.Printf("[%s] %s\n", dest.name, line1)
-				if preview {
-					ascii, _ := display.NewScreen("").Render(line1, color, scroll, 60, 255, 1, true)
-					fmt.Println(ascii)
-				} else if screen != nil {
-					if _, err := screen.Render(line1, color, scroll, 60, 255, 1, false); err != nil {
-						log.Printf("render error: %v\n", err)
-					}
-				}
+				ascii, _ := display.NewScreen("").Render(line1, color, scroll, 60, 255, 1, true)
+				fmt.Println(ascii)
 
 			case "medium":
 				line1 = dest.name
@@ -205,17 +308,10 @@ func runDepartures(ctx context.Context, siteID, interval int, color, font string
 				default:
 					line2 = fmt.Sprintf("%s - %s", deps[0].Display, deps[1].Display)
 				}
-				log.Printf("[%s] %s | %s\n", dest.name, line1, line2)
-				if preview {
-					ascii, _ := display.NewScreen("").RenderTwoLines(line1, line2, color, scroll, 60, 255, true, true)
-					fmt.Println(ascii)
-				} else if screen != nil {
-					if _, err := screen.RenderTwoLines(line1, line2, color, scroll, 60, 255, true, false); err != nil {
-						log.Printf("render error: %v\n", err)
-					}
-				}
+				ascii, _ := display.NewScreen("").RenderTwoLines(line1, line2, color, scroll, 60, 255, true, true)
+				fmt.Println(ascii)
 
-			default: // small
+			default:
 				switch len(deps) {
 				case 0:
 					line1, line2 = dest.name, "No departures"
@@ -225,18 +321,10 @@ func runDepartures(ctx context.Context, siteID, interval int, color, font string
 					line1 = fmt.Sprintf("%s %s", dest.name, deps[0].Display)
 					line2 = fmt.Sprintf("%s %s", dest.name, deps[1].Display)
 				}
-				log.Printf("[%s] %s | %s\n", dest.name, line1, line2)
-				if preview {
-					ascii, _ := display.NewScreen("").RenderTwoLines(line1, line2, color, scroll, 60, 255, false, true)
-					fmt.Println(ascii)
-				} else if screen != nil {
-					if _, err := screen.RenderTwoLines(line1, line2, color, scroll, 60, 255, false, false); err != nil {
-						log.Printf("render error: %v\n", err)
-					}
-				}
+				ascii, _ := display.NewScreen("").RenderTwoLines(line1, line2, color, scroll, 60, 255, false, true)
+				fmt.Println(ascii)
 			}
 
-			// Wait display duration, checking for cancel every second
 			for i := 0; i < dest.seconds; i++ {
 				select {
 				case <-ctx.Done():
@@ -269,21 +357,15 @@ func runText(_ context.Context, text, color, size string, scroll, preview bool, 
 		return nil
 	}
 
-	log.Println("Connecting to LED display...")
 	s := display.NewScreen(address)
 	if err := s.Connect(); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer func() {
-		s.Disconnect()
-		log.Println("Disconnected.")
-	}()
+	defer s.Disconnect()
 
-	log.Printf("Sending: %q\n", text)
 	if _, err := s.Render(text, color, scroll, speed, brightness, scale, false); err != nil {
 		return err
 	}
-	log.Println("Sent!")
 	time.Sleep(2 * time.Second)
 	return nil
 }
@@ -300,18 +382,21 @@ func runServe(addr string) error {
 
 	srv := &http.Server{Addr: addr, Handler: mux}
 
+	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("Server listening on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http server: %v", err)
+			errCh <- err
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	<-quit
-	log.Println("Shutting down...")
-	return srv.Close()
+	select {
+	case <-quit:
+		return srv.Close()
+	case err := <-errCh:
+		return err
+	}
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────

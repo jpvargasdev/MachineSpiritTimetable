@@ -119,7 +119,7 @@ func (c *Client) IsConnected() bool {
 }
 
 // Write sends data to the device and waits for a notification response.
-// Returns nil response on timeout (non-fatal).
+// Returns an error if the write fails (e.g. device powered off).
 func (c *Client) Write(data []byte) ([]byte, error) {
 	// Drain stale notification
 	select {
@@ -128,6 +128,7 @@ func (c *Client) Write(data []byte) ([]byte, error) {
 	}
 
 	if _, err := c.writeChar.WriteWithoutResponse(data); err != nil {
+		c.connected = false
 		return nil, fmt.Errorf("write: %w", err)
 	}
 
