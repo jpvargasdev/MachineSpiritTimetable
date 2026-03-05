@@ -25,5 +25,5 @@ COPY --from=builder /app/xyaod .
 EXPOSE 8080
 
 ENTRYPOINT ["./xyaod"]
-CMD ["serve"]
+CMD ["run"]
 

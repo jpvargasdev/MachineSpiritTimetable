@@ -94,7 +94,49 @@ func main() {
 	}
 	serveCmd.Flags().StringVar(&httpAddr, "addr", ":8080", "HTTP listen address")
 
-	root.AddCommand(departureCmd, textCmd, serveCmd)
+	// ── run mode (site + serve concurrently) ───────────────────────────
+	var (
+		runSiteID   int
+		runInterval int
+		runFont     string
+		runColor    string
+		runScroll   bool
+		runAddress  string
+		runHTTPAddr string
+	)
+
+	runCmd := &cobra.Command{
+		Use:   "run",
+		Short: "Start HTTP server and departure display concurrently",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			errCh := make(chan error, 2)
+			go func() {
+				errCh <- runServe(runHTTPAddr)
+			}()
+			go func() {
+				errCh <- runDepartures(ctx, runSiteID, runInterval, runColor, runFont, runScroll, false, runAddress)
+			}()
+
+			select {
+			case <-ctx.Done():
+				return nil
+			case err := <-errCh:
+				return err
+			}
+		},
+	}
+	runCmd.Flags().IntVarP(&runSiteID, "site", "s", defaultSiteID, "SL site ID")
+	runCmd.Flags().IntVarP(&runInterval, "interval", "i", 30, "API refresh interval in seconds")
+	runCmd.Flags().StringVarP(&runFont, "font", "f", "small", "Font size: small, medium, large")
+	runCmd.Flags().StringVarP(&runColor, "color", "c", "red", fmt.Sprintf("Display color %v", colorNames()))
+	runCmd.Flags().BoolVar(&runScroll, "scroll", false, "Enable scrolling animation")
+	runCmd.Flags().StringVar(&runAddress, "address", "", "BLE device address (default: built-in)")
+	runCmd.Flags().StringVar(&runHTTPAddr, "addr", ":8080", "HTTP listen address")
+
+	root.AddCommand(departureCmd, textCmd, serveCmd, runCmd)
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -374,7 +416,7 @@ func runText(_ context.Context, text, color, size string, scroll, preview bool, 
 
 func runServe(addr string) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
