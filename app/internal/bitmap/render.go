@@ -132,6 +132,65 @@ func renderLine(rows []uint32, text string, fontDict map[rune]Glyph, fHeight int
 	}
 }
 
+// RenderFullscreen renders text centered on the display using FontBold at 2x scale.
+func RenderFullscreen(text string) [][]uint32 {
+	const scale = 2
+	const boldFontHeight = 7
+
+	// Collect glyphs and calculate total width
+	glyphs := make([]Glyph, 0, len(text))
+	totalWidth := 0
+	for _, ch := range text {
+		if g, ok := FontBold[ch]; ok {
+			glyphs = append(glyphs, g)
+			totalWidth += g.Width * scale
+		} else if g, ok := FontBold[' ']; ok {
+			glyphs = append(glyphs, g)
+			totalWidth += g.Width * scale
+		}
+	}
+
+	if len(glyphs) == 0 {
+		return [][]uint32{make([]uint32, displayRows)}
+	}
+
+	// Center horizontally and vertically
+	startCol := (pageWidth - totalWidth) / 2
+	if startCol < 0 {
+		startCol = 0
+	}
+	scaledHeight := boldFontHeight * scale
+	startRow := (displayRows - scaledHeight) / 2
+
+	rows := make([]uint32, displayRows)
+	col := startCol
+
+	for _, g := range glyphs {
+		for fontRow := 0; fontRow < boldFontHeight; fontRow++ {
+			glyphVal := g.Rows[fontRow]
+			for sy := 0; sy < scale; sy++ {
+				dispRow := startRow + fontRow*scale + sy
+				if dispRow < 0 || dispRow >= displayRows {
+					continue
+				}
+				for bit := 0; bit < g.Width; bit++ {
+					if glyphVal&(1<<uint(g.Width-1-bit)) != 0 {
+						for sx := 0; sx < scale; sx++ {
+							pixCol := col + bit*scale + sx
+							if pixCol >= 0 && pixCol < pageWidth {
+								rows[dispRow] |= 1 << uint(pixCol)
+							}
+						}
+					}
+				}
+			}
+		}
+		col += g.Width * scale
+	}
+
+	return [][]uint32{rows}
+}
+
 // RenderTwoLines renders two lines of text into a single page using the small
 // or medium font. Line1 appears at top, line2 at bottom.
 func RenderTwoLines(line1, line2 string, useMedium bool) [][]uint32 {

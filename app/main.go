@@ -182,7 +182,7 @@ func runDepartures(ctx context.Context, siteID, interval int, color, font string
 			continue
 		}
 
-		err := runDeparturesLoop(ctx, slApi, screen, siteID, interval, color, font, scroll)
+		err := runLoop(ctx, slApi, screen, siteID, interval, color, font, scroll)
 		screen.Disconnect()
 
 		if err == nil || ctx.Err() != nil {
@@ -200,90 +200,110 @@ func runDepartures(ctx context.Context, siteID, interval int, color, font string
 // errBLE is returned when a BLE write fails so the outer loop can reconnect.
 var errBLE = fmt.Errorf("ble error")
 
-func runDeparturesLoop(ctx context.Context, slApi *api.SLApi, screen *display.Screen, siteID, interval int, color, font string, scroll bool) error {
+func runLoop(ctx context.Context, slApi *api.SLApi, screen *display.Screen, siteID, interval int, color, font string, scroll bool) error {
 	var cachedResp *api.DeparturesResponse
 	var lastFetch time.Time
 
+	// Render list defines what to display in sequence
+	renderList := []string{"time", "departures"}
+
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-
-		if cachedResp == nil || time.Since(lastFetch) >= time.Duration(interval)*time.Second {
-			resp, err := slApi.GetDepartures(siteID, "METRO")
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-time.After(5 * time.Second):
-				}
-				continue
-			}
-			cachedResp = resp
-			lastFetch = time.Now()
-		}
-
-		byDest := map[string][]api.Departure{}
-		for _, d := range cachedResp.Departures {
-			byDest[d.Destination] = append(byDest[d.Destination], d)
-		}
-
-		for _, dest := range destinations {
+		for _, item := range renderList {
 			select {
 			case <-ctx.Done():
 				return nil
 			default:
 			}
 
-			deps := byDest[dest.name]
-			var line1, line2 string
-			var renderErr error
-
-			switch font {
-			case "large":
-				if len(deps) > 0 {
-					line1 = fmt.Sprintf("%s %s", dest.name, deps[0].Display)
-				} else {
-					line1 = fmt.Sprintf("%s --", dest.name)
+			switch item {
+			case "time":
+				now := time.Now()
+				timeStr := now.Format("15:04")
+				if _, err := screen.RenderFullscreen(timeStr, color, 255, false); err != nil {
+					return errBLE
 				}
-				_, renderErr = screen.Render(line1, color, scroll, 60, 255, 1, false)
-
-			case "medium":
-				line1 = dest.name
-				switch len(deps) {
-				case 0:
-					line2 = "--"
-				case 1:
-					line2 = deps[0].Display
-				default:
-					line2 = fmt.Sprintf("%s - %s", deps[0].Display, deps[1].Display)
-				}
-				_, renderErr = screen.RenderTwoLines(line1, line2, color, scroll, 60, 255, true, false)
-
-			default: // small
-				switch len(deps) {
-				case 0:
-					line1, line2 = dest.name, "No departures"
-				case 1:
-					line1, line2 = fmt.Sprintf("%s %s", dest.name, deps[0].Display), ""
-				default:
-					line1 = fmt.Sprintf("%s %s", dest.name, deps[0].Display)
-					line2 = fmt.Sprintf("%s %s", dest.name, deps[1].Display)
-				}
-				_, renderErr = screen.RenderTwoLines(line1, line2, color, scroll, 60, 255, false, false)
-			}
-
-			if renderErr != nil {
-				return errBLE
-			}
-
-			for i := 0; i < dest.seconds; i++ {
 				select {
 				case <-ctx.Done():
 					return nil
-				case <-time.After(time.Second):
+				case <-time.After(3 * time.Second):
+				}
+
+			case "departures":
+				if cachedResp == nil || time.Since(lastFetch) >= time.Duration(interval)*time.Second {
+					resp, err := slApi.GetDepartures(siteID, "METRO")
+					if err != nil {
+						select {
+						case <-ctx.Done():
+							return nil
+						case <-time.After(5 * time.Second):
+						}
+						continue
+					}
+					cachedResp = resp
+					lastFetch = time.Now()
+				}
+
+				byDest := map[string][]api.Departure{}
+				for _, d := range cachedResp.Departures {
+					byDest[d.Destination] = append(byDest[d.Destination], d)
+				}
+
+				for _, dest := range destinations {
+					select {
+					case <-ctx.Done():
+						return nil
+					default:
+					}
+
+					deps := byDest[dest.name]
+					var line1, line2 string
+					var renderErr error
+
+					switch font {
+					case "large":
+						if len(deps) > 0 {
+							line1 = fmt.Sprintf("%s %s", dest.name, deps[0].Display)
+						} else {
+							line1 = fmt.Sprintf("%s --", dest.name)
+						}
+						_, renderErr = screen.Render(line1, color, scroll, 60, 255, 1, false)
+
+					case "medium":
+						line1 = dest.name
+						switch len(deps) {
+						case 0:
+							line2 = "--"
+						case 1:
+							line2 = deps[0].Display
+						default:
+							line2 = fmt.Sprintf("%s - %s", deps[0].Display, deps[1].Display)
+						}
+						_, renderErr = screen.RenderTwoLines(line1, line2, color, scroll, 60, 255, true, false)
+
+					default: // small
+						switch len(deps) {
+						case 0:
+							line1, line2 = dest.name, "No departures"
+						case 1:
+							line1, line2 = fmt.Sprintf("%s %s", dest.name, deps[0].Display), ""
+						default:
+							line1 = fmt.Sprintf("%s %s", dest.name, deps[0].Display)
+							line2 = fmt.Sprintf("%s %s", dest.name, deps[1].Display)
+						}
+						_, renderErr = screen.RenderTwoLines(line1, line2, color, scroll, 60, 255, false, false)
+					}
+
+					if renderErr != nil {
+						return errBLE
+					}
+
+					for i := 0; i < dest.seconds; i++ {
+						select {
+						case <-ctx.Done():
+							return nil
+						case <-time.After(time.Second):
+						}
+					}
 				}
 			}
 		}

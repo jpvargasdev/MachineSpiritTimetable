@@ -59,6 +59,19 @@ func (s *Screen) RenderTwoLines(line1, line2, color string, scroll bool, speed, 
 	return "", s.send(pages, rgb, scroll, speed, brightness)
 }
 
+// RenderFullscreen sends text centered fullscreen using bold font at 2x scale.
+// If preview is true it returns ASCII art without sending.
+func (s *Screen) RenderFullscreen(text, color string, brightness uint8, preview bool) (string, error) {
+	rgb := bitmap.ParseColor(color)
+	pages := bitmap.RenderFullscreen(text)
+
+	if preview {
+		return bitmap.PagesToASCII(pages), nil
+	}
+
+	return "", s.send(pages, rgb, false, 0, brightness)
+}
+
 func (s *Screen) send(pages [][]uint32, color [3]uint8, scroll bool, speed, brightness uint8) error {
 	handshake := protocol.BuildHandshake()
 	textInit := protocol.BuildTextInit(0x03, 0x02)
