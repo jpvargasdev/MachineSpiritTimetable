@@ -134,7 +134,7 @@ func renderLine(rows []uint32, text string, fontDict map[rune]Glyph, fHeight int
 
 // RenderFullscreen renders text centered on the display using FontBold at 2x scale.
 func RenderFullscreen(text string) [][]uint32 {
-	const scale = 2
+	const scale = 1
 	const boldFontHeight = 7
 
 	// Collect glyphs and calculate total width
@@ -165,6 +165,101 @@ func RenderFullscreen(text string) [][]uint32 {
 	rows := make([]uint32, displayRows)
 	col := startCol
 
+	for _, g := range glyphs {
+		for fontRow := 0; fontRow < boldFontHeight; fontRow++ {
+			glyphVal := g.Rows[fontRow]
+			for sy := 0; sy < scale; sy++ {
+				dispRow := startRow + fontRow*scale + sy
+				if dispRow < 0 || dispRow >= displayRows {
+					continue
+				}
+				for bit := 0; bit < g.Width; bit++ {
+					if glyphVal&(1<<uint(g.Width-1-bit)) != 0 {
+						for sx := 0; sx < scale; sx++ {
+							pixCol := col + bit*scale + sx
+							if pixCol >= 0 && pixCol < pageWidth {
+								rows[dispRow] |= 1 << uint(pixCol)
+							}
+						}
+					}
+				}
+			}
+		}
+		col += g.Width * scale
+	}
+
+	return [][]uint32{rows}
+}
+
+// RenderWeather renders weather icon + temperature + degree symbol centered on display.
+// iconName should be "sun", "cloud", or "rain".
+func RenderWeather(iconName string, temp int) [][]uint32 {
+	const scale = 1
+	const boldFontHeight = 7
+
+	rows := make([]uint32, displayRows)
+
+	// Get the weather icon
+	icon, hasIcon := WeatherIcons[iconName]
+	if !hasIcon {
+		icon = WeatherIcons["sun"] // default
+	}
+
+	// Build temperature string (e.g., "5°")
+	tempStr := fmt.Sprintf("%d°", temp)
+
+	// Collect glyphs for temperature
+	var glyphs []Glyph
+	for _, ch := range tempStr {
+		if g, ok := FontBold[ch]; ok {
+			glyphs = append(glyphs, g)
+		}
+	}
+
+	// Calculate total width: icon (scaled) + gap + temp glyphs (scaled)
+	iconWidth := icon.Width * scale
+	gap := 2 * scale // gap between icon and temp
+	tempWidth := 0
+	for _, g := range glyphs {
+		tempWidth += g.Width * scale
+	}
+	totalWidth := iconWidth + gap + tempWidth
+
+	// Center horizontally
+	startCol := (pageWidth - totalWidth) / 2
+	if startCol < 0 {
+		startCol = 0
+	}
+
+	// Center vertically
+	scaledHeight := boldFontHeight * scale
+	startRow := (displayRows - scaledHeight) / 2
+
+	col := startCol
+
+	// Render icon
+	for fontRow := 0; fontRow < boldFontHeight; fontRow++ {
+		iconVal := icon.Rows[fontRow]
+		for sy := 0; sy < scale; sy++ {
+			dispRow := startRow + fontRow*scale + sy
+			if dispRow < 0 || dispRow >= displayRows {
+				continue
+			}
+			for bit := 0; bit < icon.Width; bit++ {
+				if iconVal&(1<<uint(icon.Width-1-bit)) != 0 {
+					for sx := 0; sx < scale; sx++ {
+						pixCol := col + bit*scale + sx
+						if pixCol >= 0 && pixCol < pageWidth {
+							rows[dispRow] |= 1 << uint(pixCol)
+						}
+					}
+				}
+			}
+		}
+	}
+	col += iconWidth + gap
+
+	// Render temperature glyphs
 	for _, g := range glyphs {
 		for fontRow := 0; fontRow < boldFontHeight; fontRow++ {
 			glyphVal := g.Rows[fontRow]

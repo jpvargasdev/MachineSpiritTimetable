@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"machine/config"
 	"machine/internal/api"
 	"machine/internal/bitmap"
 	"machine/internal/display"
@@ -19,6 +21,8 @@ import (
 const defaultSiteID = 9293
 
 func main() {
+	config.Load()
+
 	root := &cobra.Command{
 		Use:   "machine",
 		Short: "Display SL departures or custom text on XyaoLED",
@@ -41,7 +45,7 @@ func main() {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			return runDepartures(ctx, siteID, interval, color, font, scroll, preview, address)
+			return runDepartures(ctx, siteID, interval, color, font, scroll, preview, address, config.WeatherKey(), config.Latitude(), config.Longitude())
 		},
 	}
 	departureCmd.Flags().IntVarP(&siteID, "site", "s", defaultSiteID, "SL site ID")
@@ -117,7 +121,7 @@ func main() {
 				errCh <- runServe(runHTTPAddr)
 			}()
 			go func() {
-				errCh <- runDepartures(ctx, runSiteID, runInterval, runColor, runFont, runScroll, false, runAddress)
+				errCh <- runDepartures(ctx, runSiteID, runInterval, runColor, runFont, runScroll, false, runAddress, config.WeatherKey(), config.Latitude(), config.Longitude())
 			}()
 
 			select {
@@ -155,8 +159,9 @@ var destinations = []destination{
 	{"Norsborg", 5},
 }
 
-func runDepartures(ctx context.Context, siteID, interval int, color, font string, scroll, preview bool, address string) error {
+func runDepartures(ctx context.Context, siteID, interval int, color, font string, scroll, preview bool, address string, weatherKey string, lat, lon float64) error {
 	slApi := api.NewSLApi()
+	weatherApi := api.NewWeatherApi(weatherKey)
 
 	// Preview mode — no BLE needed
 	if preview {
@@ -182,7 +187,7 @@ func runDepartures(ctx context.Context, siteID, interval int, color, font string
 			continue
 		}
 
-		err := runLoop(ctx, slApi, screen, siteID, interval, color, font, scroll)
+		err := runLoop(ctx, slApi, weatherApi, screen, siteID, interval, color, font, scroll, lat, lon)
 		screen.Disconnect()
 
 		if err == nil || ctx.Err() != nil {
@@ -200,12 +205,14 @@ func runDepartures(ctx context.Context, siteID, interval int, color, font string
 // errBLE is returned when a BLE write fails so the outer loop can reconnect.
 var errBLE = fmt.Errorf("ble error")
 
-func runLoop(ctx context.Context, slApi *api.SLApi, screen *display.Screen, siteID, interval int, color, font string, scroll bool) error {
+func runLoop(ctx context.Context, slApi *api.SLApi, weatherApi *api.WeatherApi, screen *display.Screen, siteID, interval int, color, font string, scroll bool, lat, lon float64) error {
 	var cachedResp *api.DeparturesResponse
 	var lastFetch time.Time
+	var cachedWeather *api.WeatherResponse
+	var lastWeatherFetch time.Time
 
 	// Render list defines what to display in sequence
-	renderList := []string{"time", "departures"}
+	renderList := []string{"time", "weather", "departures"}
 
 	for {
 		for _, item := range renderList {
@@ -219,7 +226,41 @@ func runLoop(ctx context.Context, slApi *api.SLApi, screen *display.Screen, site
 			case "time":
 				now := time.Now()
 				timeStr := now.Format("15:04")
+				log.Printf("[time] displaying %s", timeStr)
 				if _, err := screen.RenderFullscreen(timeStr, color, 255, false); err != nil {
+					return errBLE
+				}
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(3 * time.Second):
+				}
+
+			case "weather":
+				// Fetch weather every 10 minutes
+				if cachedWeather == nil || time.Since(lastWeatherFetch) >= 10*time.Minute {
+					log.Printf("[weather] fetching weather data")
+					resp, err := weatherApi.GetWeather(lat, lon)
+					if err == nil {
+						cachedWeather = resp
+						lastWeatherFetch = time.Now()
+						log.Printf("[weather] fetched: %.1f°C", cachedWeather.Current.Temp)
+					} else {
+						log.Printf("[weather] fetch error: %v", err)
+					}
+				}
+				// Skip weather display if no data available
+				if cachedWeather == nil {
+					log.Printf("[weather] no data, skipping")
+					continue
+				}
+				temp := int(cachedWeather.Current.Temp)
+				iconName := "sun"
+				if len(cachedWeather.Current.Weather) > 0 {
+					iconName = api.ConditionToIcon(cachedWeather.Current.Weather[0].ID)
+				}
+				log.Printf("[weather] displaying %s %d°", iconName, temp)
+				if _, err := screen.RenderWeather(iconName, temp, color, 255, false); err != nil {
 					return errBLE
 				}
 				select {
@@ -256,6 +297,7 @@ func runLoop(ctx context.Context, slApi *api.SLApi, screen *display.Screen, site
 					}
 
 					deps := byDest[dest.name]
+
 					var line1, line2 string
 					var renderErr error
 

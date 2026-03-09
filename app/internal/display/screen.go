@@ -72,6 +72,20 @@ func (s *Screen) RenderFullscreen(text, color string, brightness uint8, preview 
 	return "", s.send(pages, rgb, false, 0, brightness)
 }
 
+// RenderWeather sends weather icon + temperature centered on the display.
+// iconName should be "sun", "cloud", or "rain".
+// If preview is true it returns ASCII art without sending.
+func (s *Screen) RenderWeather(iconName string, temp int, color string, brightness uint8, preview bool) (string, error) {
+	rgb := bitmap.ParseColor(color)
+	pages := bitmap.RenderWeather(iconName, temp)
+
+	if preview {
+		return bitmap.PagesToASCII(pages), nil
+	}
+
+	return "", s.send(pages, rgb, false, 0, brightness)
+}
+
 func (s *Screen) send(pages [][]uint32, color [3]uint8, scroll bool, speed, brightness uint8) error {
 	handshake := protocol.BuildHandshake()
 	textInit := protocol.BuildTextInit(0x03, 0x02)
