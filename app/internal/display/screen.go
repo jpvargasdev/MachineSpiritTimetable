@@ -3,9 +3,9 @@ package display
 import (
 	"fmt"
 
-	"xyaod/internal/bitmap"
-	"xyaod/internal/ble"
-	"xyaod/internal/protocol"
+	"machine/internal/bitmap"
+	"machine/internal/ble"
+	"machine/internal/protocol"
 )
 
 // Screen is the high-level interface for the XyaoLED display.

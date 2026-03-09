@@ -1,4 +1,4 @@
-module xyaod
+module machine 
 
 go 1.23.2
 

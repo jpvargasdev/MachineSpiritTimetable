@@ -10,7 +10,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=1 GOOS=linux go build -o xyaod .
+RUN CGO_ENABLED=1 GOOS=linux go build -o machine .
 
 # Stage 2: Runtime
 FROM alpine:latest
@@ -19,11 +19,11 @@ RUN apk add --no-cache bluez dbus
 
 WORKDIR /app
 
-COPY --from=builder /app/xyaod .
+COPY --from=builder /app/machine .
 
 # Expose ports for Go app
 EXPOSE 8080
 
-ENTRYPOINT ["./xyaod"]
+ENTRYPOINT ["./machine"]
 CMD ["run"]
 

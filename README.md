@@ -13,10 +13,10 @@ Displays Stockholm public transit (SL) departure times on a XyaoLED BLE LED matr
 ## Commands
 
 ```
-xyaod run     # Start departure display + HTTP server concurrently (default)
-xyaod site    # Departure display loop only
-xyaod text    # Send custom text to the display
-xyaod serve   # HTTP server only
+machine run     # Start departure display + HTTP server concurrently (default)
+machine site    # Departure display loop only
+machine text    # Send custom text to the display
+machine serve   # HTTP server only
 ```
 
 ### `run` (recommended)
@@ -24,7 +24,7 @@ xyaod serve   # HTTP server only
 Starts both the departure loop and the HTTP health server in the same process.
 
 ```
-xyaod run [flags]
+machine run [flags]
 
 Flags:
   -s, --site int        SL site ID (default 9293)
@@ -41,7 +41,7 @@ Flags:
 Send a one-shot message to the display.
 
 ```
-xyaod text -t "Hello" -c yellow --scroll
+machine text -t "Hello" -c yellow --scroll
 ```
 
 ### Preview mode
@@ -49,8 +49,8 @@ xyaod text -t "Hello" -c yellow --scroll
 Add `--preview` / `-p` to any command to render an ASCII preview in the terminal without connecting to the device.
 
 ```
-xyaod site --preview -f medium -c yellow
-xyaod text -t "Hello" --preview
+machine site --preview -f medium -c yellow
+machine text -t "Hello" --preview
 ```
 
 ## Configuration
@@ -69,7 +69,7 @@ SL_API_KEY=your_api_key_here
 
 ## Docker
 
-The image defaults to `xyaod run`. Override the command to pass flags:
+The image defaults to `machine run`. Override the command to pass flags:
 
 ```yaml
 image: ghcr.io/jpvargasdev/machinespirittimetable:latest
@@ -104,7 +104,7 @@ machinespirittimetable:
 
 ```
 cd app
-go build -o xyaod .
+go build -o machine .
 ```
 
 Requires CGO and BlueZ/dbus headers on Linux:

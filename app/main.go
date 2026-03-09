@@ -11,16 +11,16 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"xyaod/internal/api"
-	"xyaod/internal/bitmap"
-	"xyaod/internal/display"
+	"machine/internal/api"
+	"machine/internal/bitmap"
+	"machine/internal/display"
 )
 
 const defaultSiteID = 9293
 
 func main() {
 	root := &cobra.Command{
-		Use:   "xyaod",
+		Use:   "machine",
 		Short: "Display SL departures or custom text on XyaoLED",
 	}
 
