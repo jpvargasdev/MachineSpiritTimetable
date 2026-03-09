@@ -45,7 +45,7 @@ func main() {
 		},
 	}
 	departureCmd.Flags().IntVarP(&siteID, "site", "s", defaultSiteID, "SL site ID")
-	departureCmd.Flags().IntVarP(&interval, "interval", "i", 30, "API refresh interval in seconds")
+	departureCmd.Flags().IntVarP(&interval, "interval", "i", 60, "API refresh interval in seconds")
 	departureCmd.Flags().StringVarP(&font, "font", "f", "small", "Font size: small, medium, large")
 	departureCmd.Flags().StringVarP(&color, "color", "c", "red", fmt.Sprintf("Display color %v", colorNames()))
 	departureCmd.Flags().BoolVar(&scroll, "scroll", false, "Enable scrolling animation")
@@ -229,6 +229,14 @@ func runDeparturesLoop(ctx context.Context, slApi *api.SLApi, screen *display.Sc
 		for _, d := range cachedResp.Departures {
 			byDest[d.Destination] = append(byDest[d.Destination], d)
 		}
+
+    now := time.Now().Format("00:00")
+    _, renderErr := screen.Render(now, color, scroll, 60, 255, 1, false)
+    if renderErr != nil {
+      return errBLE
+    }
+
+    time.Sleep(5 * time.Second)
 
 		for _, dest := range destinations {
 			select {
