@@ -230,14 +230,6 @@ func runDeparturesLoop(ctx context.Context, slApi *api.SLApi, screen *display.Sc
 			byDest[d.Destination] = append(byDest[d.Destination], d)
 		}
 
-    now := time.Now().Format("15:04")
-    _, renderErr := screen.Render(now, color, scroll, 60, 255, 1, false)
-    if renderErr != nil {
-      return errBLE
-    }
-
-    time.Sleep(5 * time.Second)
-
 		for _, dest := range destinations {
 			select {
 			case <-ctx.Done():
