@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"time"
 
+  _ "time/tzdata"
+
 	"github.com/spf13/cobra"
 
 	"machine/config"
