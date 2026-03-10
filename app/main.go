@@ -223,7 +223,11 @@ func runLoop(ctx context.Context, slApi *api.SLApi, weatherApi *api.WeatherApi, 
 
 			switch item {
 			case "time":
-				now := time.Now()
+        location, err := time.LoadLocation("Europe/Berlin")
+        if err != nil {
+          panic(err)
+        }
+        now := time.Now().In(location)
 				timeStr := now.Format("15:04")
 				if _, err := screen.RenderFullscreen(timeStr, color, 255, false); err != nil {
 					return errBLE
