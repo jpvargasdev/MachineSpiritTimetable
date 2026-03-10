@@ -113,11 +113,3 @@ Requires CGO and BlueZ/dbus headers on Linux:
 apt install libbluetooth-dev libdbus-1-dev
 ```
 
-## Releasing
-
-Push a version tag to trigger the GitHub Actions workflow, which builds and pushes a multi-arch image to GHCR:
-
-```
-git tag v0.0.4
-git push origin v0.0.4
-```
