@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -155,8 +154,8 @@ type destination struct {
 }
 
 var destinations = []destination{
-	{"Ropsten", 10},
-	{"Norsborg", 5},
+	{"Ropsten", 3},
+	{"Norsborg", 3},
 }
 
 func runDepartures(ctx context.Context, siteID, interval int, color, font string, scroll, preview bool, address string, weatherKey string, lat, lon float64) error {
@@ -226,7 +225,6 @@ func runLoop(ctx context.Context, slApi *api.SLApi, weatherApi *api.WeatherApi, 
 			case "time":
 				now := time.Now()
 				timeStr := now.Format("15:04")
-				log.Printf("[time] displaying %s", timeStr)
 				if _, err := screen.RenderFullscreen(timeStr, color, 255, false); err != nil {
 					return errBLE
 				}
@@ -239,19 +237,14 @@ func runLoop(ctx context.Context, slApi *api.SLApi, weatherApi *api.WeatherApi, 
 			case "weather":
 				// Fetch weather every 10 minutes
 				if cachedWeather == nil || time.Since(lastWeatherFetch) >= 10*time.Minute {
-					log.Printf("[weather] fetching weather data")
 					resp, err := weatherApi.GetWeather(lat, lon)
 					if err == nil {
 						cachedWeather = resp
 						lastWeatherFetch = time.Now()
-						log.Printf("[weather] fetched: %.1f°C", cachedWeather.Current.Temp)
-					} else {
-						log.Printf("[weather] fetch error: %v", err)
 					}
 				}
 				// Skip weather display if no data available
 				if cachedWeather == nil {
-					log.Printf("[weather] no data, skipping")
 					continue
 				}
 				temp := int(cachedWeather.Current.Temp)
@@ -259,7 +252,6 @@ func runLoop(ctx context.Context, slApi *api.SLApi, weatherApi *api.WeatherApi, 
 				if len(cachedWeather.Current.Weather) > 0 {
 					iconName = api.ConditionToIcon(cachedWeather.Current.Weather[0].ID)
 				}
-				log.Printf("[weather] displaying %s %d°", iconName, temp)
 				if _, err := screen.RenderWeather(iconName, temp, color, 255, false); err != nil {
 					return errBLE
 				}
